@@ -1,0 +1,8 @@
+/build/
+/results/
+*.log
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
