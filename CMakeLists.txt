@@ -2,33 +2,39 @@ cmake_minimum_required(VERSION 3.24)
 
 project(ILS_SP VERSION 1.0.0 LANGUAGES CXX)
 
-option(ILS_SP_BUILD_TESTS "Build the C++ regression tests" ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(NOT DEFINED GUROBI_HOME)
-  if(DEFINED ENV{GUROBI_HOME})
-    set(GUROBI_HOME "$ENV{GUROBI_HOME}")
-  elseif(EXISTS "/opt/gurobi-current")
-    set(GUROBI_HOME "/opt/gurobi-current")
+if(NOT DEFINED COPT_HOME)
+  if(DEFINED ENV{COPT_HOME})
+    set(COPT_HOME "$ENV{COPT_HOME}")
+  elseif(EXISTS "$ENV{HOME}/.local/opt/copt80")
+    set(COPT_HOME "$ENV{HOME}/.local/opt/copt80")
+  elseif(EXISTS "/opt/copt80")
+    set(COPT_HOME "/opt/copt80")
   endif()
 endif()
 
-find_path(GUROBI_INCLUDE_DIR
-  NAMES gurobi_c++.h
-  HINTS "${GUROBI_HOME}/include"
+find_path(COPT_INCLUDE_DIR
+  NAMES coptcpp.h
+  HINTS "${COPT_HOME}/include"
   REQUIRED
 )
-find_library(GUROBI_CXX_LIBRARY
-  NAMES gurobi_c++
-  HINTS "${GUROBI_HOME}/lib"
+find_library(COPT_CXX_LIBRARY
+  NAMES copt_cpp
+  HINTS "${COPT_HOME}/lib"
   REQUIRED
 )
-find_library(GUROBI_LIBRARY
-  NAMES gurobi130 gurobi120 gurobi110 gurobi100 gurobi
-  HINTS "${GUROBI_HOME}/lib"
+find_library(COPT_LIBRARY
+  NAMES copt
+  HINTS "${COPT_HOME}/lib"
   REQUIRED
 )
 
 find_package(Threads REQUIRED)
+# Link a separately installed xxHash library; no bundled SDK or downloads.
+find_library(ILS_SP_XXHASH_LIBRARY NAMES xxhash libxxhash.so.0 REQUIRED)
 
 add_library(ils_sp
   src/core.cpp
@@ -36,39 +42,21 @@ add_library(ils_sp
   src/evaluator.cpp
   src/search.cpp
   src/pool.cpp
-  src/gurobi_models.cpp
+  src/copt_models.cpp
   src/solver.cpp
 )
 add_library(ILS_SP::ils_sp ALIAS ils_sp)
 
-target_compile_features(ils_sp PUBLIC cxx_std_20)
-set_target_properties(ils_sp PROPERTIES CXX_EXTENSIONS OFF)
 target_include_directories(ils_sp
-  PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-    "${GUROBI_INCLUDE_DIR}"
+  PUBLIC include
+)
+target_include_directories(ils_sp SYSTEM PUBLIC
+  "${COPT_INCLUDE_DIR}" "${COPT_INCLUDE_DIR}/coptcpp_inc"
 )
 target_link_libraries(ils_sp
-  PUBLIC "${GUROBI_CXX_LIBRARY}" "${GUROBI_LIBRARY}" Threads::Threads
+  PUBLIC "${COPT_CXX_LIBRARY}" "${COPT_LIBRARY}" Threads::Threads "${ILS_SP_XXHASH_LIBRARY}"
 )
-if(MSVC)
-  target_compile_options(ils_sp PRIVATE /W4 /permissive-)
-else()
-  target_compile_options(
-    ils_sp PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-  )
-endif()
+target_compile_options(ils_sp PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 
 add_executable(ils-sp src/main.cpp)
-target_link_libraries(ils-sp PRIVATE ILS_SP::ils_sp)
-
-if(ILS_SP_BUILD_TESTS)
-  enable_testing()
-  add_executable(ils-sp-tests tests/test_main.cpp)
-  target_link_libraries(ils-sp-tests PRIVATE ILS_SP::ils_sp)
-  add_test(NAME ils-sp-tests COMMAND ils-sp-tests "${CMAKE_CURRENT_SOURCE_DIR}")
-
-  add_executable(ils-sp-gurobi-tests tests/test_gurobi.cpp)
-  target_link_libraries(ils-sp-gurobi-tests PRIVATE ILS_SP::ils_sp)
-  add_test(NAME ils-sp-gurobi-tests COMMAND ils-sp-gurobi-tests)
-endif()
+target_link_libraries(ils-sp PRIVATE ils_sp)

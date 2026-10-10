@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 5,
   "configurePresets": [
     {
       "name": "dev",
@@ -8,8 +8,7 @@
       "binaryDir": "${sourceDir}/build/dev-make",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "ILS_SP_BUILD_TESTS": "ON"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
     {
@@ -18,25 +17,18 @@
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/release-make",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "ILS_SP_BUILD_TESTS": "ON"
+        "CMAKE_BUILD_TYPE": "Release"
       }
     }
   ],
   "buildPresets": [
-    { "name": "dev", "configurePreset": "dev" },
-    { "name": "release", "configurePreset": "release" }
-  ],
-  "testPresets": [
     {
       "name": "dev",
-      "configurePreset": "dev",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "dev"
     },
     {
       "name": "release",
-      "configurePreset": "release",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "release"
     }
   ]
 }

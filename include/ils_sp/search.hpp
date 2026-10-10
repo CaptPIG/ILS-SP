@@ -3,8 +3,13 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <new>
+#include <type_traits>
 #include <random>
 #include <unordered_set>
+#include <variant>
 
 #include "ils_sp/evaluator.hpp"
 
@@ -17,6 +22,7 @@ enum class DestroyOperator {
   ClosestRemoval
 };
 enum class RepairOperator { GreedyInsertion, TwoRegretInsertion };
+enum class PartialRouteSubset { Prefix, Random };
 enum class Neighborhood {
   Swap,
   Relocate,
@@ -89,6 +95,24 @@ struct RepairTimingStatistics {
   double post_hint_s{};
 };
 
+// Optional coarse timings for the standalone catalog diagnostic. No clocks
+// are sampled for these phases when the caller does not request them.
+struct PathCatalogStatistics {
+  bool cache_hit{};
+  double setup_s{};
+  double enumeration_s{};
+  double candidate_views_s{};
+  double candidate_sort_s{};
+  double dominance_filter_s{};
+  double workspace_release_s{};
+  double descriptor_materialization_s{};
+  double label_materialization_s{};
+  double option_sort_s{};
+  double cache_admission_s{};
+  double cleanup_s{};
+  double export_s{};
+};
+
 // Aggregate timings for deterministic affected-gap completion.  Timers are
 // sampled once per coarse phase, never once per station-path option.
 struct PathCompletionStatistics {
@@ -148,6 +172,7 @@ class GranularNeighborhood {
 
   std::size_t gamma_size_{};
   std::unordered_map<int, std::size_t> customer_rank_by_id_;
+  bool consecutive_customer_ids_{};
   std::vector<unsigned char> promising_matrix_;
   std::unordered_map<int, std::vector<int>> directed_neighbors_;
   std::unordered_map<int, std::vector<int>> promising_neighbors_;
@@ -155,10 +180,36 @@ class GranularNeighborhood {
   EdgeSet promising_edges_;
 };
 
+struct ReplacementSummaryStatistics {
+  std::uint64_t hits{};
+  std::uint64_t misses{};
+  std::uint64_t labels_built{};
+  std::size_t groups{};
+  std::size_t bytes{};
+  std::size_t peak_bytes{};
+  std::size_t evictions{};
+  bool bound_certified{};
+  std::uint64_t bound_checks{};
+  std::uint64_t bound_pruned{};
+  std::uint64_t travel_hits{};
+  bool fp_fallback{};
+  std::uint64_t tail_checks{};
+  // Raw descriptors, including current/excluded paths; not eligible scores.
+  std::uint64_t raw_tail_descriptors_skipped{};
+  std::uint64_t partial_bound_hits{};
+  std::uint64_t propagation_pruned{};
+};
+
 class PathSampler {
  public:
+  // Lower bound for a new customer inserted into a source route. Unsupported
+  // numerical/route domains return -infinity, disabling linked pruning.
+  [[nodiscard]] double linked_insertion_lower_bound(
+      const RouteCostSummary& summary, double penalty_lambda,
+      std::size_t source_visits, std::size_t source_customers) const;
   PathSampler(const Instance& instance, PlanFactory& factory,
-              std::mt19937_64& random);
+              std::mt19937_64& random, bool complete_paths = true,
+              bool implicit_replacement = false);
 
   [[nodiscard]] std::optional<Solution> random_replacement(
       const Solution& solution);
@@ -177,11 +228,15 @@ class PathSampler {
   // Starting from direct paths for every new directed anchor pair, repeatedly
   // apply the best strictly improving single-gap replacement.  Paths inherited
   // from the incumbent are never eligible.
+  // Experimental single_step selects one existing summary-best proposal,
+  // full-verifies it, and stops even if that proposal fails full verification.
+  // The default retains the original fixed-point completion everywhere.
   [[nodiscard]] Plan repair_new_gaps(
       Plan plan, const PlanFactory::GapMap& inherited_gaps,
       double penalty_lambda,
       std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+          std::nullopt,
+      bool single_step = false);
   // Repair the introduced/reversed gaps and allow every inherited nonempty
   // charging path on the changed route to be shortened, removed, or replaced.
   [[nodiscard]] Plan repair_affected_paths(
@@ -191,7 +246,8 @@ class PathSampler {
           std::nullopt,
       PathCompletionStatistics* statistics = nullptr);
   [[nodiscard]] std::vector<std::vector<int>> paths_between(
-      int origin_id, int target_id);
+      int origin_id, int target_id,
+      PathCatalogStatistics* statistics = nullptr);
   [[nodiscard]] VirtualInsertionCompletion virtual_complete_insertion(
       const Plan* source_plan, std::size_t position, int customer_id,
       double penalty_lambda,
@@ -202,16 +258,16 @@ class PathSampler {
       std::optional<std::chrono::steady_clock::time_point> deadline =
           std::nullopt);
   [[nodiscard]] std::size_t option_cache_size() const noexcept {
-    return option_cache_.size();
+    return catalog_cache_.size();
   }
   [[nodiscard]] std::size_t option_cache_hits() const noexcept {
-    return option_cache_.hits();
+    return catalog_cache_.hits();
   }
   [[nodiscard]] std::size_t option_cache_misses() const noexcept {
-    return option_cache_.misses();
+    return catalog_cache_.misses();
   }
   [[nodiscard]] std::size_t option_cache_evictions() const noexcept {
-    return option_cache_.evictions();
+    return catalog_cache_.evictions();
   }
   [[nodiscard]] std::size_t option_first_builds() const noexcept {
     return option_first_builds_;
@@ -238,8 +294,124 @@ class PathSampler {
       const noexcept {
     return virtual_completion_cache_.evictions();
   }
+  [[nodiscard]] const ReplacementSummaryStatistics&
+  replacement_summary_statistics() const noexcept {
+    return replacement_summary_statistics_;
+  }
 
  private:
+  friend class VariableNeighborhoodDescent;
+  struct RandomReplacementProposal {
+    std::size_t route_index{};
+    Plan plan;
+  };
+  [[nodiscard]] std::optional<RandomReplacementProposal>
+  random_replacement_proposal(const Solution& solution);
+
+  [[nodiscard]] static double catalog_travel_lower_bound(double distance, double speed);
+  struct PathDescriptor {
+    // Packed catalogs store MSB-first nonzero four-bit station codes; flat
+    // catalogs store the original offset in the low 32 bits and size above it.
+    std::uint64_t station_storage{};
+    double total_distance_km{};
+  };
+  static_assert(sizeof(PathDescriptor) == 16);
+  struct CatalogDiskBacking;
+  // Keep the frozen vector layout separately so the experimental reader does
+  // not change the original logical LRU charge or catalogue identity schedule.
+  struct PathCatalogPayload {
+    using DecodeBuffer = std::array<int, 15>;
+    std::vector<PathDescriptor> paths;
+    std::vector<int> station_ids;
+    std::vector<std::uint32_t> lexical_order;
+    DecodeBuffer packed_station_ids{};
+    std::uint8_t packed_station_count{};
+    bool packed{};
+  };
+  struct PathCatalog : PathCatalogPayload {
+    std::shared_ptr<const CatalogDiskBacking> disk_backing;
+    [[nodiscard]] std::uint64_t encode_path(
+        std::span<const int> stations, std::uint32_t flat_offset) const;
+    [[nodiscard]] std::size_t path_size(const PathDescriptor& path) const noexcept;
+    [[nodiscard]] std::span<const int> stations(
+        const PathDescriptor& path, DecodeBuffer& decoded) const;
+    [[nodiscard]] bool lexically_less(
+        const PathDescriptor& left, const PathDescriptor& right) const;
+    [[nodiscard]] std::size_t retained_bytes() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
+  };
+  struct CatalogBlockKey {
+    std::uint64_t record{}, offset{};
+    bool operator==(const CatalogBlockKey&) const = default;
+  };
+  struct CatalogBlockKeyHash {
+    std::size_t operator()(const CatalogBlockKey& key) const noexcept {
+      std::size_t seed = std::hash<std::uint64_t>{}(key.record);
+      hash_combine(seed, key.offset);
+      return seed;
+    }
+  };
+  struct CatalogPageState {
+    using Page = std::vector<unsigned char>;
+    LruCache<CatalogBlockKey, std::shared_ptr<const Page>, CatalogBlockKeyHash>
+        pages{std::numeric_limits<std::size_t>::max()};
+    std::size_t budget{64 * 1024 * 1024}, bytes{}, peak_bytes{};
+    std::size_t active_readers{}, peak_readers{};
+    std::uint64_t hits{}, misses{}, bytes_read{}, failures{}, audits{};
+    double read_s{};
+  };
+  struct CatalogDiskBacking {
+    std::array<std::uint64_t, 32> header{};
+    std::string file;
+    using BlockChecksum = std::array<std::uint64_t, 2>;
+    std::vector<BlockChecksum> block_hashes;
+    std::shared_ptr<CatalogPageState> state;
+    std::uint64_t record_id{};
+  };
+  // Short-lived, noncopyable reader. Scalar values are copied out of verified
+  // pages, so callers cannot retain a pointer into an evictable cache block.
+  struct CatalogReader {
+    explicit CatalogReader(const PathCatalog& catalog);
+    ~CatalogReader();
+    CatalogReader(const CatalogReader&) = delete;
+    CatalogReader& operator=(const CatalogReader&) = delete;
+    [[nodiscard]] PathDescriptor descriptor(std::size_t index) const;
+    [[nodiscard]] std::uint32_t lexical_index(std::size_t ordinal) const;
+    [[nodiscard]] std::pair<std::size_t, std::size_t> equal_range(
+        const std::vector<int>& path) const;
+    void verify_all() const;
+    const PathCatalog& catalog;
+   private:
+    [[noreturn]] void fail(const char* reason) const;
+    void copy_value(void* destination, std::size_t width, std::uint64_t section,
+                    std::uint64_t section_bytes, std::uint64_t relative,
+                    std::size_t hash_base) const;
+    std::shared_ptr<const CatalogDiskBacking> backing;
+    int fd{-1};
+  };
+  // Optional, run-local backing store. A fresh explicit workspace directory
+  // owns these files; ordinary runs retain the original RAM-only behavior.
+  struct CatalogDiskCache {
+    using Header = std::array<std::uint64_t, 32>;
+    struct Record {
+      Header header{};
+      bool complete{};
+      std::shared_ptr<const CatalogDiskBacking> backing;
+    };
+    std::filesystem::path root;
+    std::unordered_map<AnchorPair, Record, AnchorPairHash> records;
+    std::uint64_t byte_limit{8ULL * 1024 * 1024 * 1024};
+    std::uint64_t metadata_limit{128ULL * 1024 * 1024}, metadata_bytes{};
+    std::shared_ptr<CatalogPageState> page_state;
+    std::uint64_t charged_bytes{}, bytes_read{}, bytes_written{};
+    std::uint64_t hits{}, misses{}, stores{}, failures{}, quota_skips{}, fp_skips{};
+    double read_s{}, write_s{};
+    bool requested{}, enabled{};
+    ~CatalogDiskCache();
+  };
+  void initialize_catalog_disk_cache();
+  [[nodiscard]] std::shared_ptr<const PathCatalog> disk_cache_load(AnchorPair key);
+  void disk_cache_store(AnchorPair key, const PathCatalog& catalog);
   struct PathOption {
     std::vector<int> stations;
     double total_distance_km{};
@@ -260,12 +432,152 @@ class PathSampler {
     std::vector<int> stations;
   };
   using PathOptions = std::vector<PathOption>;
+  // The double alternative is only exact physical label travel, never a
+  // charging summary, penalty-dependent bound, or retained rejection decision.
+  // The lower-bound alternative contains only raw physical evidence from
+  // this full input's deterministic Algorithm-3 trace, never a cutoff or lambda.
+  using ReplacementSummaryRow =
+      std::variant<std::monostate, double, NonlinearCostLowerBound, RouteCostSummary>;
+  static_assert(sizeof(ReplacementSummaryRow) ==
+                sizeof(std::optional<RouteCostSummary>));
+  // Preserve the original dense logical charge/LRU. This separate, capped
+  // ledger includes every rounded bitmap and its owning shared_ptr header.
+  struct ReplacementRowAuxiliary {
+    static constexpr std::size_t kMaximumBytes = 128 * 1024;
+    explicit ReplacementRowAuxiliary(std::size_t limit = kMaximumBytes)
+        : limit_bytes(limit) {
+      if (limit > kMaximumBytes) throw std::invalid_argument("row bitmap cap");
+    }
+    const std::size_t limit_bytes;
+    std::size_t bytes{}, peak_bytes{};
+    std::uint64_t logical_rows_reserved{}, rows_constructed{}, dense_fallbacks{};
+  };
+  class ReplacementRows {
+    using Owner = std::shared_ptr<ReplacementRowAuxiliary>;
+    using Allocator = std::allocator<ReplacementSummaryRow>;
+    static_assert(std::is_trivially_destructible_v<std::monostate> &&
+                  std::is_trivially_destructible_v<double> &&
+                  std::is_trivially_destructible_v<NonlinearCostLowerBound> &&
+                  std::is_trivially_destructible_v<RouteCostSummary> &&
+                  std::is_trivially_destructible_v<ReplacementSummaryRow>);
+    static_assert(std::is_nothrow_default_constructible_v<ReplacementSummaryRow>);
+    static_assert(sizeof(Owner) % alignof(std::uint64_t) == 0);
+    static constexpr std::size_t words_for(std::size_t count) noexcept {
+      return count / 64 + (count % 64 != 0);
+    }
+    static constexpr std::size_t bitmap_bytes(std::size_t count) noexcept {
+      return sizeof(Owner) + words_for(count) * sizeof(std::uint64_t);
+    }
+    std::uint64_t* bits() const noexcept {
+      return reinterpret_cast<std::uint64_t*>(
+          reinterpret_cast<unsigned char*>(bitmap_) + sizeof(Owner));
+    }
+   public:
+    ReplacementRows() = default;
+    ReplacementRows(const ReplacementRows&) = delete;
+    ReplacementRows& operator=(const ReplacementRows&) = delete;
+    ReplacementRows(ReplacementRows&& other) noexcept { swap(other); }
+    ReplacementRows& operator=(ReplacementRows&& other) noexcept {
+      if (this != &other) { clear(); swap(other); }
+      return *this;
+    }
+    ~ReplacementRows() { clear(); }
+    void swap(ReplacementRows& other) noexcept {
+      std::swap(size_, other.size_);
+      std::swap(rows_, other.rows_);
+      std::swap(bitmap_, other.bitmap_);
+    }
+    void clear() noexcept {
+      // Rows are trivially destructible, including any inactive raw slots.
+      // No destructor is invoked for an object whose lifetime never began.
+      if (rows_ != nullptr) Allocator{}.deallocate(rows_, size_);
+      if (bitmap_ != nullptr) {
+        (*bitmap_)->bytes -= bitmap_bytes(size_);
+        std::destroy_at(bitmap_);
+        ::operator delete(bitmap_);
+      }
+      size_ = 0; rows_ = nullptr; bitmap_ = nullptr;
+    }
+    void initialize(std::size_t count, const Owner& owner) {
+      ReplacementRows fresh;
+      if (count != 0) {
+        fresh.size_ = count;
+        fresh.rows_ = Allocator{}.allocate(count);
+        const std::size_t charge = bitmap_bytes(count);
+        if (owner->bytes <= owner->limit_bytes &&
+            charge <= owner->limit_bytes - owner->bytes) {
+          try {
+            void* storage = ::operator new(charge);
+            fresh.bitmap_ = std::construct_at(static_cast<Owner*>(storage), owner);
+            std::uninitialized_value_construct_n(fresh.bits(), words_for(count));
+            owner->bytes += charge;
+            owner->peak_bytes = std::max(owner->peak_bytes, owner->bytes);
+          } catch (const std::bad_alloc&) {
+            // Optional auxiliary memory cannot reject an otherwise successful
+            // dense row allocation. Retain original eager initialization.
+          }
+        }
+        owner->logical_rows_reserved += count;
+        if (fresh.bitmap_ == nullptr) {
+          std::uninitialized_value_construct_n(fresh.rows_, count);
+          owner->rows_constructed += count;
+          ++owner->dense_fallbacks;
+        }
+      }
+      swap(fresh);
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] bool lazy() const noexcept { return bitmap_ != nullptr; }
+    // Inspection never starts an inactive row's lifetime or mutates cache state.
+    [[nodiscard]] const ReplacementSummaryRow* peek_if_initialized(
+        std::size_t index) const noexcept {
+      if (index >= size_) return nullptr;
+      if (bitmap_ != nullptr &&
+          (bits()[index / 64] & (std::uint64_t{1} << (index % 64))) == 0)
+        return nullptr;
+      return rows_ + index;
+    }
+    ReplacementSummaryRow& operator[](std::size_t index) {
+      if (index >= size_) throw std::out_of_range("replacement row index");
+      if (bitmap_ != nullptr) {
+        auto& word = bits()[index / 64];
+        const auto mask = std::uint64_t{1} << (index % 64);
+        if ((word & mask) == 0) {
+          std::construct_at(rows_ + index);
+          word |= mask;
+          ++(*bitmap_)->rows_constructed;
+        }
+      }
+      return rows_[index];
+    }
+   private:
+    std::size_t size_{};
+    ReplacementSummaryRow* rows_{};
+    Owner* bitmap_{};
+  };
+  static_assert(sizeof(ReplacementRows) == sizeof(std::vector<ReplacementSummaryRow>));
+  struct ReplacementGapSummaries {
+    // Physical rows depend on the ordered immutable path descriptors, not on
+    // charging-label LRU residency. A rebuild still invalidates every row.
+    std::weak_ptr<const PathCatalog> catalog;
+    ReplacementRows rows;
+  };
+  struct ReplacementSummaryTable {
+    std::vector<ReplacementGapSummaries> gaps;
+    std::size_t bytes{};
+  };
 
-  [[nodiscard]] std::vector<std::vector<int>> alternatives(
+  [[nodiscard]] std::optional<std::vector<int>> sample_explicit_path(
       int origin_id, int target_id, const std::vector<int>& current_path);
+  [[nodiscard]] std::shared_ptr<const PathCatalog> path_catalog(
+      int origin_id, int target_id,
+      RepairTimingStatistics* timing = nullptr,
+      PathCatalogStatistics* statistics = nullptr);
   [[nodiscard]] std::shared_ptr<const PathOptions> path_options(
       int origin_id, int target_id,
-      RepairTimingStatistics* timing = nullptr);
+      RepairTimingStatistics* timing = nullptr,
+      PathCatalogStatistics* statistics = nullptr);
   [[nodiscard]] std::optional<Plan> improving_atomic_replacement(
       const Plan& plan, std::size_t gap, const std::vector<int>& stations,
       double penalty_lambda,
@@ -319,6 +631,24 @@ class PathSampler {
   const Instance& instance_;
   PlanFactory& factory_;
   std::mt19937_64& random_;
+  bool complete_paths_;
+  bool implicit_replacement_;
+  // Representation oracle controlled only by PathSamplerTestAccess.
+  bool packed_catalogs_enabled_{true};
+  // Construction representation oracle, independent of final catalog packing.
+  bool packed_construction_enabled_{true};
+  // Direct-contract oracle; no public search option or alternate heuristic.
+  bool catalog_first_leg_index_enabled_{true};
+  bool zero_shift_energy_bound_enabled_{true};
+  [[nodiscard]] static std::optional<double> zero_shift_energy_cost_bound(
+      double travel, double service, const Vehicle& vehicle, double lambda);
+  const double maximum_charging_rate_wh_per_h_;
+  std::optional<double> linked_triangle_slack_h_;
+  friend struct PathSamplerTestAccess;
+  [[nodiscard]] bool path_dominated(int origin, int target,
+                                     const std::vector<int>& path) const;
+  [[nodiscard]] std::optional<std::vector<int>> sample_implicit_path(
+      int origin, int target, const std::vector<int>& current);
   std::unordered_map<std::string, std::size_t> curve_rank_by_type_;
   std::vector<std::size_t> station_curve_ranks_;
   std::unordered_map<int, std::vector<ReachableStation>>
@@ -332,8 +662,28 @@ class PathSampler {
   std::unordered_set<AnchorPair, AnchorPairHash> option_keys_built_;
   std::size_t option_first_builds_{};
   std::size_t option_rebuilds_{};
+  // Immutable physical catalogs are shared by export, uniform sampling and
+  // scoring. Large charging labels have a separate 128 MiB payload cache;
+  // ordinary random ReplacePath never constructs those labels.
+  LruCache<AnchorPair, std::shared_ptr<const PathCatalog>, AnchorPairHash>
+      catalog_cache_{std::numeric_limits<std::size_t>::max()};
+  std::size_t catalog_cache_bytes_{};
+  std::size_t catalog_cache_budget_{1024 * 1024 * 1024};
+  CatalogDiskCache catalog_disk_cache_;
   LruCache<AnchorPair, std::shared_ptr<const PathOptions>, AnchorPairHash>
-      option_cache_{8'192};
+      option_cache_{std::numeric_limits<std::size_t>::max()};
+  std::size_t option_cache_bytes_{};
+  std::shared_ptr<ReplacementRowAuxiliary> replacement_row_auxiliary_{
+      std::make_shared<ReplacementRowAuxiliary>()};
+  LruCache<std::vector<int>, std::shared_ptr<ReplacementSummaryTable>,
+           IntVectorHash> replacement_summaries_{65'536};
+  std::size_t replacement_summary_bytes_{};
+  // Includes physical keys, gap metadata and numeric rows; container overhead
+  // is bounded separately by the group count. No completion decisions.
+  std::size_t replacement_summary_budget_{32 * 1024 * 1024};
+  ReplacementSummaryStatistics replacement_summary_statistics_;
+  bool bulk_replacement_bound_enabled_{true};
+  bool shortfall_replacement_bound_enabled_{true};
   LruCache<VirtualCompletionCacheKey,
            std::shared_ptr<const VirtualInsertionCompletion>,
            VirtualCompletionCacheKeyHash>
@@ -343,6 +693,11 @@ class PathSampler {
 };
 
 struct InsertionCandidateStatistics {
+  std::uint64_t physical_insertion_decisions{};
+  std::uint64_t physical_insertion_candidates{};
+  std::uint64_t physical_route_profiles_built{};
+  std::uint64_t partial_route_events{};
+  std::uint64_t randomized_partial_routes{};
   std::uint64_t decisions{};
   std::uint64_t greedy_decisions{};
   std::uint64_t two_regret_decisions{};
@@ -387,7 +742,9 @@ class InitialSolutionBuilder {
                          PathSampler& path_sampler, std::mt19937_64& random,
                          SearchProfile profile = SearchProfile::Paper,
                          std::size_t promising_arc_count = 40,
-                         std::size_t granular_threshold = 100);
+                         std::size_t granular_threshold = 100,
+                         bool rebuild_station_paths = false,
+                         bool preserve_station_visits = false);
   [[nodiscard]] Solution build(double penalty_lambda);
   [[nodiscard]] const InsertionCandidateStatistics& statistics() const
       noexcept {
@@ -400,8 +757,9 @@ class InitialSolutionBuilder {
   PathSampler& path_sampler_;
   std::mt19937_64& random_;
   SearchProfile profile_;
+  bool rebuild_station_paths_;
+  bool preserve_station_visits_;
   std::unique_ptr<GranularNeighborhood> granular_;
-  double maximum_charging_rate_wh_per_h_{};
   InsertionCandidateStatistics statistics_;
 };
 
@@ -416,7 +774,9 @@ class Perturbation {
                PathSampler& path_sampler, std::mt19937_64& random,
                SearchProfile profile = SearchProfile::Paper,
                std::size_t promising_arc_count = 40,
-               std::size_t granular_threshold = 100);
+               std::size_t granular_threshold = 100,
+               PartialRouteSubset partial_route_subset = PartialRouteSubset::Prefix,
+               bool preserve_station_visits = false);
   [[nodiscard]] Solution apply(const Solution& solution,
                                double penalty_lambda);
   [[nodiscard]] const InsertionCandidateStatistics& statistics() const
@@ -435,14 +795,20 @@ class Perturbation {
                                 double penalty_lambda,
                                 std::vector<InsertionPathHint>* hints =
                                     nullptr);
+  [[nodiscard]] Solution repair_preserving_stations(
+      DestroyedSolution destroyed, RepairOperator operation,
+      double penalty_lambda);
 
   const Instance& instance_;
   PlanFactory& factory_;
   PathSampler& path_sampler_;
   std::mt19937_64& random_;
   SearchProfile profile_;
+  PartialRouteSubset partial_route_subset_;
+  bool preserve_station_visits_{};
+  // Isolated full-gate candidate: enable repair-only one-step completion.
+  bool single_step_repair_completion_{true};
   std::unique_ptr<GranularNeighborhood> granular_;
-  double maximum_charging_rate_wh_per_h_{};
   InsertionCandidateStatistics statistics_;
   std::unique_ptr<RouteSequenceScorer> sequence_scorer_;
 };
@@ -459,12 +825,22 @@ struct VndStatistics {
   std::uint64_t slice_routes_evaluated{};
   std::uint64_t relocate_source_summary_hits{};
   std::uint64_t relocate_source_summary_misses{};
+  std::uint64_t physical_summary_hits{};
+  std::uint64_t physical_summary_misses{};
+  std::uint64_t physical_summary_cache_groups{};
+  std::uint64_t physical_summary_cache_bytes{};
+  std::uint64_t physical_summary_cache_peak_bytes{};
+  std::uint64_t physical_summary_cache_evictions{};
   std::uint64_t accepted_moves{};
   // VND winner attempts only; initialization and perturbation are not counted.
   std::uint64_t linked_completion_attempts{};
   std::uint64_t linked_completion_changed_attempts{};
   std::uint64_t replace_path_calls{};
   std::uint64_t replace_path_accepted{};
+  // Non-adaptive VND proposals, including null implicit proposals.
+  std::uint64_t replace_path_proposals{};
+  std::uint64_t replace_path_null_proposals{};
+  std::uint64_t replace_path_nonimproving_proposals{};
   std::uint64_t adaptive_customer_advances{};
   std::uint64_t adaptive_replace_path_selections{};
   std::uint64_t adaptive_inserted_replace_path_failures{};
@@ -474,12 +850,17 @@ struct VndStatistics {
 };
 
 class VariableNeighborhoodDescent {
+  friend struct VndTestAccess;
+
  public:
   VariableNeighborhoodDescent(const Instance& instance, PlanFactory& factory,
                               PathSampler& path_sampler,
                               std::mt19937_64& random,
                               std::size_t promising_arc_count = 40,
-                              SearchProfile profile = SearchProfile::Paper);
+                              SearchProfile profile = SearchProfile::Paper,
+                              std::size_t replace_path_attempts = 1,
+                              bool project_opening_station_visits = false,
+                              bool preserve_swap_station_visits = false);
 
   [[nodiscard]] Solution improve(
       Solution solution, double penalty_lambda,
@@ -505,6 +886,12 @@ class VariableNeighborhoodDescent {
     std::array<DescribedRouteChange, 2> changes{};
     std::size_t change_count{};
   };
+
+  [[nodiscard]] static bool described_move_less(
+      const MoveDescriptor& left, const MoveDescriptor& right,
+      const std::vector<std::vector<int>>& current);
+  void order_relocate_moves(const std::vector<std::vector<int>>& current);
+  void order_two_opt_moves(const std::vector<std::vector<int>>& current);
 
   struct MoveMemoryKey {
     Neighborhood neighborhood{};
@@ -541,12 +928,55 @@ class VariableNeighborhoodDescent {
 
   enum class SupportState : unsigned char { Unknown, Open, Closed };
 
+  // Physical inputs, not scores or winners. Absolute route slots are absent:
+  // the two input identities follow the support's local slot order.
+  struct PhysicalSupportKey {
+    Neighborhood neighborhood{};
+    std::array<std::uint64_t, 2> routes{};
+    bool opens_route{};
+    bool operator==(const PhysicalSupportKey&) const = default;
+  };
+  struct PhysicalSupportKeyHash {
+    std::size_t operator()(const PhysicalSupportKey& key) const noexcept {
+      std::size_t seed = static_cast<std::size_t>(key.neighborhood);
+      hash_combine(seed, key.routes[0]);
+      hash_combine(seed, key.routes[1]);
+      hash_combine(seed, key.opens_route);
+      return seed;
+    }
+  };
+  // The customer-move cache is consumed only by generalized_cost. Keep its
+  // three physical inputs, never a lambda-dependent score or feasibility proof.
+  struct PhysicalScoreSummary {
+    double raw_cost_h{};
+    double energy_shortfall_wh{};
+    double duration_excess_h{};
+
+    PhysicalScoreSummary() = default;
+    explicit PhysicalScoreSummary(const RouteCostSummary& summary) noexcept
+        : raw_cost_h(summary.raw_cost_h),
+          energy_shortfall_wh(summary.energy_shortfall_wh),
+          duration_excess_h(summary.duration_excess_h) {}
+    [[nodiscard]] double generalized_cost(const Instance& instance,
+                                          double penalty_lambda) const;
+  };
+  struct PhysicalSummaryRow {
+    std::array<PhysicalScoreSummary, 2> summaries{};
+    unsigned char valid{};
+  };
+  struct PhysicalSummaryTable {
+    std::vector<PhysicalSummaryRow> rows;
+  };
+
   struct SupportWorkingMemory {
     std::uint64_t epoch{};
     SupportState state{SupportState::Unknown};
     bool active{};
     MoveMemoryKey key{};
     MoveMemoryEntry entry{};
+    // Borrowed only in this epoch; best_customer_neighbor owns the tables
+    // until the pass ends and support_memory clears this before another epoch.
+    PhysicalSummaryTable* physical_summaries{};
   };
 
   [[nodiscard]] std::optional<Solution> best_neighbor(
@@ -558,7 +988,8 @@ class VariableNeighborhoodDescent {
       double penalty_lambda,
       std::optional<std::chrono::steady_clock::time_point> deadline);
   [[nodiscard]] std::optional<Solution> replace_path_neighbor(
-      const Solution& solution, double penalty_lambda);
+      const Solution& solution, double penalty_lambda,
+      std::optional<std::chrono::steady_clock::time_point> deadline);
   [[nodiscard]] Solution inserted_replace_path(
       Solution solution, double penalty_lambda,
       std::span<const AnchorPair> dirty_anchor_pairs,
@@ -575,19 +1006,45 @@ class VariableNeighborhoodDescent {
   PathSampler& path_sampler_;
   std::mt19937_64& random_;
   SearchProfile profile_;
+  std::size_t replace_path_attempts_;
+  bool project_opening_station_visits_;
+  // Immutable per VND/cache owner; the two physical scoring domains never mix.
+  const bool preserve_swap_station_visits_;
+  struct SwapPhysicalProfile {
+    std::vector<int> visits;
+    std::vector<std::size_t> customer_slots;
+    std::unique_ptr<PhysicalRouteScorer> scorer;
+  };
+  std::vector<SwapPhysicalProfile> swap_profiles_;
   LruCache<MoveMemoryKey, MoveMemoryEntry, MoveMemoryKeyHash> move_memory_{
       100'000};
   std::unordered_map<std::vector<int>, std::uint64_t, IntVectorHash>
       route_versions_;
   std::uint64_t next_route_version_{1};
+  // A separate bounded identity registry survives ILS calls. Eviction assigns
+  // a fresh identity on reinsertion, so it can only lose physical cache hits.
+  LruCache<std::vector<int>, std::uint64_t, IntVectorHash>
+      physical_route_ids_{8'192};
+  std::uint64_t next_physical_route_id_{1};
+  LruCache<PhysicalSupportKey, std::shared_ptr<PhysicalSummaryTable>,
+           PhysicalSupportKeyHash> physical_summaries_{65'536};
+  std::size_t physical_summary_bytes_{};
+  std::size_t physical_summary_budget_{32 * 1024 * 1024};
   std::unique_ptr<RouteSequenceScorer> sequence_scorer_;
   std::vector<SupportWorkingMemory> support_working_memory_;
   std::uint64_t support_epoch_{};
   std::vector<std::pair<int, int>> swap_customer_pairs_;
+  // Rebuilt each customer-neighborhood pass; preserves open route supports.
+  std::vector<unsigned char> customer_open_support_flags_;
+  std::vector<unsigned char> swap_order_flags_;
   std::vector<std::tuple<int, std::size_t, std::size_t>> relocate_moves_;
   std::vector<
       std::tuple<std::size_t, std::size_t, std::size_t, std::size_t, bool>>
       two_opt_moves_;
+  // Per-pass integer ordering workspace; no scoring or decisions survive it.
+  std::vector<std::size_t> order_gap_offsets_;
+  std::vector<unsigned char> relocate_order_flags_;
+  std::vector<unsigned char> two_opt_order_flags_;
   VndStatistics statistics_;
   const std::array<Neighborhood, 4> order_{Neighborhood::Swap,
                                            Neighborhood::Relocate,

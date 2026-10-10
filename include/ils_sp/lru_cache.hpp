@@ -56,6 +56,15 @@ class LruCache {
     index_.clear();
   }
 
+  [[nodiscard]] std::optional<Value> discard_oldest() {
+    if (order_.empty()) return std::nullopt;
+    Value result = std::move(order_.front().second);
+    index_.erase(order_.front().first);
+    order_.pop_front();
+    ++evictions_;
+    return result;
+  }
+
   [[nodiscard]] std::size_t size() const noexcept { return index_.size(); }
   [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
   [[nodiscard]] std::size_t hits() const noexcept { return hits_; }
@@ -75,4 +84,3 @@ class LruCache {
 };
 
 }  // namespace ils_sp
-

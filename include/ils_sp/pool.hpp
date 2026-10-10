@@ -8,6 +8,8 @@
 
 namespace ils_sp {
 
+enum class PoolIdentity { OrderedSequence, CustomerCoverage };
+
 struct RouteColumn {
   Plan plan;
   std::vector<int> customer_set;
@@ -40,6 +42,8 @@ struct PoolStatistics {
   std::uint64_t admission_attempts{};
   std::uint64_t dominated_rejections{};
   std::uint64_t same_sequence_replacements{};
+  std::uint64_t same_coverage_replacements{};
+  std::uint64_t negative_reduced_cost_admissions{};
   std::uint64_t main_insertions{};
   std::uint64_t backup_insertions{};
   std::uint64_t main_demotions{};
@@ -51,7 +55,9 @@ struct PoolStatistics {
 class RoutePool {
  public:
   explicit RoutePool(std::size_t capacity = 5'000,
-                     double tolerance = kCostTolerance);
+                     double tolerance = kCostTolerance,
+                     PoolIdentity identity = PoolIdentity::OrderedSequence,
+                     bool keep_evicted_in_backup = true);
 
   [[nodiscard]] PoolUpdate admit(RouteColumn column);
   [[nodiscard]] PoolRepriceUpdate reprice_backup();
@@ -88,6 +94,8 @@ class RoutePool {
                                              IntVectorHash>;
 
   [[nodiscard]] ColumnMap::iterator worst_main();
+  [[nodiscard]] const std::vector<int>& column_key(
+      const RouteColumn& column) const;
   [[nodiscard]] std::optional<double> best_coverage_cost(
       const std::vector<int>& coverage) const;
   [[nodiscard]] bool coverage_improved(
@@ -102,6 +110,8 @@ class RoutePool {
 
   std::size_t capacity_;
   double tolerance_;
+  PoolIdentity identity_;
+  bool keep_evicted_in_backup_;
   ColumnMap main_;
   CoverageCostMap coverage_costs_;
   ColumnMap backup_;

@@ -1,8 +1,12 @@
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
+#include <variant>
 
 #include "ils_sp/core.hpp"
 #include "ils_sp/lru_cache.hpp"
@@ -42,6 +46,17 @@ struct RouteCostSummary {
                                       const Instance& instance,
                                       double penalty_lambda);
 
+// A physical lower bound on Algorithm 3's result for the same complete input.
+// It is neither a completed evaluation nor a feasibility/optimality result.
+struct NonlinearCostLowerBound {
+  double travel_time_h{};
+  double energy_shortfall_wh{};
+  double duration_excess_h{};
+
+  [[nodiscard]] double generalized_cost(const Instance& instance,
+                                        double penalty_lambda) const;
+};
+
 // A half-open customer interval in one incumbent route.  Reversed slices are
 // traversed from end - 1 down to begin.  Customer-neighborhood descriptors use
 // a constant number of these slices, so they can be scored without first
@@ -78,12 +93,50 @@ class NonlinearSequenceEvaluator {
       double penalty_lambda) const;
 
  private:
-  [[nodiscard]] RouteCostSummary evaluate_data(
+  friend class PathSampler;
+  friend struct NonlinearSequenceEvaluatorTestAccess;
+
+  using BoundedEvaluation =
+      std::variant<RouteCostSummary, NonlinearCostLowerBound>;
+  struct BoundedLimits {
+    double penalty_lambda{};
+    double incumbent_limit{};
+    double minimum_limit{};
+    bool all_charging_rates_finite{};
+  };
+
+  // The caller certifies the complete physical label, immutable Instance data
+  // and runtime FP scope. Disable builds with a different arithmetic kernel.
+  [[nodiscard]] static constexpr bool bounded_evaluation_compatible() noexcept {
+#if defined(__x86_64__) && defined(__SSE2__) && !defined(__FMA__) && \
+    !defined(__FMA4__) && !defined(__FAST_MATH__) && \
+    (!defined(__FINITE_MATH_ONLY__) || __FINITE_MATH_ONLY__ == 0) && \
+    (!defined(__FLT_EVAL_METHOD__) || __FLT_EVAL_METHOD__ == 0)
+    return sizeof(double) == 8 && std::numeric_limits<double>::is_iec559 &&
+           std::numeric_limits<double>::digits == 53;
+#else
+    return false;
+#endif
+  }
+
+  [[nodiscard]] BoundedEvaluation evaluate_bounded(
+      const ChargingSequenceLabel& route, double penalty_lambda,
+      double incumbent_limit, double minimum_limit,
+      bool all_charging_rates_finite = false) const;
+  [[nodiscard]] const ChargingCurve& station_curve(int station_id) const;
+  template <bool Bounded>
+  [[nodiscard]] std::conditional_t<Bounded, BoundedEvaluation, RouteCostSummary>
+  evaluate_data(
       double travel_time_h, double service_time_h,
       std::span<const ChargingSequenceLeg> station_legs,
-      double tail_energy_wh) const;
+      double tail_energy_wh,
+      std::conditional_t<Bounded, BoundedLimits, std::monostate> limits = {}) const;
 
   const Instance& instance_;
+  // Only immutable identities, bound lazily on the first actual CS evaluation.
+  // Each evaluator belongs to one serial worker and one immutable Instance.
+  mutable std::vector<const ChargingCurve*> station_curves_by_id_;
+  mutable bool station_curves_ready_{};
 };
 
 class RouteEvaluator {
@@ -134,11 +187,15 @@ class PlanFactory {
       std::unordered_map<AnchorPair, std::vector<int>, AnchorPairHash>;
 
   PlanFactory(const Instance& instance, RouteEvaluator& evaluator,
-              std::size_t exact_cache_capacity = 20'000);
+              std::size_t exact_cache_capacity = 20'000,
+              bool allow_inherited_station_revisits = false);
 
   [[nodiscard]] Plan make_plan(
       std::vector<int> customer_ids,
       std::vector<std::vector<int>> gaps);
+  // Preserve physical station occurrences, including repeats created when
+  // customer removal joins two formerly distinct charging paths.
+  [[nodiscard]] Plan plan_visits(std::vector<int> visits);
   [[nodiscard]] Plan plan_sequence(const std::vector<int>& customer_ids,
                                    const Solution* reference = nullptr);
   [[nodiscard]] Plan plan_sequence(const std::vector<int>& customer_ids,
@@ -162,9 +219,50 @@ class PlanFactory {
   }
 
  private:
+  void validate_node_sequence(std::span<const int> ids, NodeKind kind,
+                              const char* error);
+  [[nodiscard]] Plan assemble_plan(std::vector<int> customer_ids,
+                                  std::vector<std::vector<int>> gaps,
+                                  Route route);
+
   const Instance& instance_;
   RouteEvaluator& evaluator_;
   LruCache<std::vector<int>, Plan, IntVectorHash> exact_cache_;
+  bool allow_inherited_station_revisits_{};
+  std::vector<std::uint64_t> validation_marks_;
+  std::uint64_t validation_epoch_{};
+};
+
+// Fixed physical-route labels for the explicit customer-only LNS edit mode.
+// Slots and removal positions index Route::visits, not customer-only gaps.
+// Candidate scoring never changes, deduplicates, or completes station paths.
+class PhysicalRouteScorer {
+ public:
+  PhysicalRouteScorer(const Instance& instance, const Plan& plan,
+                      bool support_swaps = false);
+  [[nodiscard]] RouteCostSummary evaluate_replacement(
+      std::size_t physical_customer_position, int customer_id) const;
+  [[nodiscard]] RouteCostSummary evaluate_swap(
+      std::size_t first_physical_position,
+      std::size_t second_physical_position) const;
+
+  [[nodiscard]] RouteCostSummary evaluate_insertion(
+      std::size_t physical_slot, int customer_id) const;
+  [[nodiscard]] RouteCostSummary evaluate_removal(
+      std::size_t physical_customer_position) const;
+
+ private:
+  const Instance& instance_;
+  NonlinearSequenceEvaluator evaluator_;
+  // Includes the implicit departure and return depot at the two ends.
+  std::vector<int> nodes_;
+  std::unordered_set<int> customers_;
+  std::vector<ChargingSequenceLabel> prefixes_;
+  std::vector<ChargingSequenceLabel> suffixes_;
+  // Optional immutable range labels for the unchanged interior of an intra
+  // Swap. Existing LNS insertion/removal callers do not build this tree.
+  std::size_t swap_range_base_{};
+  std::vector<ChargingSequenceLabel> swap_ranges_;
 };
 
 // Vidal-style incumbent-subsequence preprocessing adapted to the Montoya
