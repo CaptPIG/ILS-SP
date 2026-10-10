@@ -13,7 +13,8 @@ equal to driving time plus charging time.
 
 This is an independent research implementation, not the authors' reference
 code. The current core version completed one N40 instance/seed at the full
-50,000-iteration budget; its N80 full-budget run is still in progress. These
+50,000-iteration budget. Its N80 run was stopped before completion for
+performance diagnosis and does not constitute a validated N80 result. These
 checks do not establish full-benchmark quality, general speed improvements,
 or reproduction of the paper's reported runtime. Results should be identified
 as results of this implementation.
