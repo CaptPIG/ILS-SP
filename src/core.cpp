@@ -29,16 +29,19 @@ ChargingCurve::ChargingCurve(std::string station_type,
 }
 
 double ChargingCurve::time_at_energy(double energy_wh) const {
-  if (energy_wh < -1e-7 || energy_wh > capacity_wh() + 1e-7) {
+  if (!std::isfinite(energy_wh) || energy_wh < -kEnergyToleranceWh ||
+      energy_wh > capacity_wh() + kEnergyToleranceWh) {
     throw std::out_of_range("energy is outside the charging curve");
   }
   const double energy = std::clamp(energy_wh, 0.0, capacity_wh());
   for (std::size_t index = 1; index < points_.size(); ++index) {
     const ChargingPoint& left = points_[index - 1];
     const ChargingPoint& right = points_[index];
-    if (energy <= right.energy_wh + 1e-9) {
+    // A tolerance in segment membership extrapolates past a breakpoint and
+    // can make the inverse charging curve decrease when the slope changes.
+    if (energy <= right.energy_wh) {
       const double delta_energy = right.energy_wh - left.energy_wh;
-      if (delta_energy <= 1e-12) {
+      if (delta_energy == 0.0) {
         return left.time_h;
       }
       const double ratio = (energy - left.energy_wh) / delta_energy;
@@ -137,11 +140,13 @@ Instance::Instance(
   int depot_count = 0;
   for (std::size_t index = 0; index < nodes_.size(); ++index) {
     const Node& current = nodes_[index];
+    nodes_indexed_by_id_ = nodes_indexed_by_id_ && current.id >= 0 &&
+                          static_cast<std::size_t>(current.id) == index;
     if (!index_by_id_.emplace(current.id, index).second) {
       throw std::invalid_argument("node ids must be unique");
     }
     if (!std::isfinite(current.x_km) || !std::isfinite(current.y_km) ||
-        current.service_time_h < 0.0) {
+        !std::isfinite(current.service_time_h) || current.service_time_h < 0.0) {
       throw std::invalid_argument("invalid node geometry or service time");
     }
     switch (current.kind) {
@@ -183,6 +188,10 @@ Instance::Instance(
 }
 
 const Node& Instance::node(int id) const {
+  if (nodes_indexed_by_id_ && id >= 0 &&
+      static_cast<std::size_t>(id) < nodes_.size()) {
+    return nodes_[static_cast<std::size_t>(id)];
+  }
   const auto found = index_by_id_.find(id);
   if (found == index_by_id_.end()) {
     throw std::out_of_range("unknown node id " + std::to_string(id));
@@ -199,6 +208,12 @@ const ChargingCurve& Instance::curve_for_station(int station_id) const {
 }
 
 double Instance::distance_km(int origin_id, int target_id) const {
+  if (nodes_indexed_by_id_ && origin_id >= 0 && target_id >= 0 &&
+      static_cast<std::size_t>(origin_id) < nodes_.size() &&
+      static_cast<std::size_t>(target_id) < nodes_.size()) {
+    return distances_km_[static_cast<std::size_t>(origin_id)]
+                        [static_cast<std::size_t>(target_id)];
+  }
   return distances_km_.at(index_by_id_.at(origin_id))
       .at(index_by_id_.at(target_id));
 }

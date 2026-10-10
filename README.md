@@ -9,13 +9,14 @@ Montoya et al. (2017) benchmark: one vehicle type, no customer demand, no
 customer time windows, no charging-station waiting functions, and an objective
 equal to driving time plus charging time.
 
-> **Implementation status**
->
-> This is an independent research implementation, not the authors' reference
-> code. It passes the included contract and Gurobi integration tests, but it
-> does not yet reproduce the solution quality and runtime reported in the TRC
-> paper consistently, particularly on larger instances. Results from this
-> repository should be identified as results of this implementation.
+**Implementation status (2026-10-10)**
+
+This is an independent research implementation, not the authors' reference
+code. The current core version completed one N40 instance/seed at the full
+50,000-iteration budget; its N80 full-budget run is still in progress. These
+checks do not establish full-benchmark quality, general speed improvements,
+or reproduction of the paper's reported runtime. Results should be identified
+as results of this implementation.
 
 ## Algorithm provenance
 
@@ -34,7 +35,7 @@ table below records the primary source used for each implemented component.
 | Route pool, set partitioning, LP reduced costs, and FRVCP | Wang et al. (2025), Section 5.2 and Algorithm 5; route-pool/SP predecessor in Wang and Zhao (2023), Algorithm 1 |
 | E-VRP-NL benchmark and piecewise-linear charging data | Montoya et al. (2017) |
 
-The implementation uses Gurobi instead of the CPLEX configuration reported by
+The implementation uses COPT instead of the CPLEX configuration reported by
 Wang et al. (2025). Details that are not uniquely specified by the papers, such
 as the charging path assigned to a gap created by a customer move, remain
 explicit implementation choices. The default `paper` profile is the closest
@@ -44,70 +45,101 @@ implemented interpretation; all other search profiles are experimental.
 
 ```text
 include/ils_sp/    public headers
-src/               library implementation and command-line executable
-tests/             contract and Gurobi integration tests
-data/evrp-2017/    minimal public benchmark subset used by the tests
+src/              core library and command-line executable
+CMakeLists.txt    COPT/xxHash build configuration
+CMakePresets.json development and release presets
 ```
 
-Experiment runners, generated results, solver binaries, and article PDFs are
-deliberately excluded from this source repository.
+This snapshot contains only the current core source. Tests, benchmark data,
+experiment runners, generated results, binaries, caches, and solver SDKs are
+excluded.
 
 ## Prerequisites
 
+- Linux, with a C++20-compatible compiler and Make
 - CMake 3.24 or newer
-- C++20-compatible compiler
-- Gurobi C++ 10, 11, 12, or 13 with a valid license
+- COPT 8.0.7 C++ SDK and a valid COPT license, installed separately
+- A separately installed xxHash shared library; version 0.8.3 is required for
+  the optional indexed disk-catalogue backend
 
-CMake resolves Gurobi through `GUROBI_HOME`, falling back to
-`/opt/gurobi-current` when available. Gurobi and its license are not included.
+Install and configure COPT using the [official installation guide](https://guide.coap.online/copt/en-doc/install.html).
+Set `COPT_HOME` to its installation directory. CMake searches for `coptcpp.h`,
+`libcopt_cpp`, and `libcopt` under that directory. The official SDK's
+`include/coptcpp_inc` directory is also required. Configure the license outside
+this repository and ensure the COPT shared libraries are available at runtime.
+COPT's SDK and license are not covered by this project's BSD license.
+
+The xxHash API declarations in this repository link to the installed library;
+no hash implementation is bundled. See [xxHash 0.8.3](https://github.com/Cyan4973/xxHash/tree/v0.8.3).
+If CMake cannot find it, pass `-DILS_SP_XXHASH_LIBRARY=...` with the full path
+to the installed shared library.
 
 ## Build
 
-Development build with tests:
+From the repository root, after setting `COPT_HOME`:
 
 ```bash
-cmake --preset dev
-cmake --build --preset dev --parallel 1
-ctest --preset dev --parallel 1 --output-on-failure
-```
-
-Optimized build:
-
-```bash
-cmake --preset release
+cmake --preset release -DCOPT_HOME="$COPT_HOME"
 cmake --build --preset release --parallel 1
 ```
 
-Set `-DILS_SP_BUILD_TESTS=OFF` at configure time when only the solver executable
-is required.
+Use the `dev` preset for a debug build. Both presets build the core library and
+`ils-sp` executable only. The source retains its existing Linux-specific
+filesystem implementation; portability to Windows or macOS is not claimed.
 
-## Quick start
+## Run
+
+Supply a Montoya-format XML instance obtained separately. For example, save
+one as `input.xml` and run the explicit current configuration:
 
 ```bash
 build/release-make/ils-sp \
-  --instance data/evrp-2017/tc0c10s2cf1.xml \
+  --instance input.xml \
   --search-profile paper \
-  --threads 1
+  --seed 84001 \
+  --iterations 50000 \
+  --threads 1 \
+  --sp-threads 4 \
+  --promising-arcs 40 \
+  --sp-stall-limit 0 \
+  --sp-time-limit 0 \
+  --progress 1500 \
+  --path-catalog complete \
+  --insertion-paths completed \
+  --pool-identity coverage \
+  --continuation record \
+  --replace-path-attempts 1 \
+  --partial-route-subset random \
+  --sp-frequency 1500 \
+  --backup-frequency 1500 \
+  --pool-capacity 5000 \
+  --adaptive-sp-stall 0 \
+  --route-opening-paths projected \
+  --initialization-paths physical \
+  --preserve-swap-stations
 ```
 
-Run `ils-sp --help` for the complete command-line interface. The paper-scale
-defaults are 50,000 ILS iterations, a 5,000-route main pool, and an SP call
-every 1,500 completed iterations. Per-SP engineering safeguards can be disabled
-with `--sp-stall-limit 0 --sp-time-limit 0` when an uncapped run is required.
+`--threads 1 --sp-threads 4` uses four threads only for the integer SP model;
+LP and FRVCP retain one thread. Omitting options can select different CLI
+defaults. Run `build/release-make/ils-sp --help` for the full interface.
+
+The indexed disk-catalogue backend is opt-in via `ILS_SP_CATALOG_DISK_DIR`.
+Leave that variable unset for ordinary use. The unchanged backend requires
+xxHash 0.8.3 and a new directory whose existing parent resolves beneath
+`/workspace/`, on a non-memory filesystem with 4096-byte blocks and sufficient
+free space. These guards are retained from the frozen core version.
 
 ## Benchmark data
 
-The repository includes only the four public Montoya instances required by the
-test suite. The complete 120-instance E-VRP-NL benchmark is available from
-[VRP-REP](https://www.vrp-rep.org/datasets/item/2016-0020.html) under dataset ID
-`2016-0020`.
+Benchmark XML files are not included. The Montoya E-VRP-NL benchmark is
+available from [VRP-REP](https://www.vrp-rep.org/datasets/item/2016-0020.html),
+dataset ID `2016-0020`. Refer to that source for attribution and terms.
 
 ## License
 
 The original source code and documentation in this repository are licensed
-under the [BSD 3-Clause License](LICENSE). The benchmark XML files under
-`data/evrp-2017/` are third-party research data and are not relicensed by this
-project; see [data/README.md](data/README.md) for their source and attribution.
+under the [BSD 3-Clause License](LICENSE). COPT and xxHash are separate
+dependencies governed by their respective licenses.
 
 ## References
 

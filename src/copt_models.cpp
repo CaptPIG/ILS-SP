@@ -1,11 +1,15 @@
-#include "ils_sp/gurobi_models.hpp"
+#include "ils_sp/copt_models.hpp"
+#include "ils_sp/detail/copt_result_validation.hpp"
+#include "callbackbase.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <deque>
 #include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <set>
@@ -27,8 +31,8 @@ constexpr double kDeadlineGuardSeconds = 0.01;
 template <typename Result>
 [[nodiscard]] Result time_limit_result(ModelClock::time_point start) {
   Result result;
-  result.status = GRB_TIME_LIMIT;
-  result.status_name = gurobi_status_name(GRB_TIME_LIMIT);
+  result.status = COPT_STATUS_TIMEOUT;
+  result.status_name = copt_status_name(COPT_STATUS_TIMEOUT);
   result.wall_runtime_s = wall_seconds(start);
   return result;
 }
@@ -38,14 +42,14 @@ struct ModelTimeBudget {
   std::optional<double> applied_time_limit_s;
 };
 
-[[nodiscard]] bool deadline_exhausted(GurobiDeadline deadline) {
+[[nodiscard]] bool deadline_exhausted(CoptDeadline deadline) {
   return deadline.has_value() &&
          std::chrono::duration<double>(*deadline - ModelClock::now()).count() <=
              kDeadlineGuardSeconds;
 }
 
-[[nodiscard]] GurobiDeadline bounded_deadline(
-    ModelClock::time_point start, GurobiDeadline deadline,
+[[nodiscard]] CoptDeadline bounded_deadline(
+    ModelClock::time_point start, CoptDeadline deadline,
     std::optional<double> maximum_wall_time_s) {
   if (!maximum_wall_time_s.has_value()) return deadline;
   const auto local_deadline =
@@ -58,7 +62,7 @@ struct ModelTimeBudget {
 }
 
 [[nodiscard]] ModelTimeBudget model_time_budget(
-    const GurobiConfig& config, GurobiDeadline deadline) {
+    const CoptConfig& config, CoptDeadline deadline) {
   std::optional<double> limit = config.time_limit_s;
   if (deadline.has_value()) {
     const double remaining =
@@ -74,33 +78,30 @@ struct ModelTimeBudget {
                          .applied_time_limit_s = limit};
 }
 
-void apply_time_budget(GRBModel& model, const ModelTimeBudget& budget) {
+void apply_time_budget(Model& model, const ModelTimeBudget& budget) {
   if (budget.applied_time_limit_s.has_value()) {
-    model.set(GRB_DoubleParam_TimeLimit, *budget.applied_time_limit_s);
+    model.SetDblParam(COPT_DBLPARAM_TIMELIMIT, *budget.applied_time_limit_s);
   }
 }
 
-[[nodiscard]] GurobiModelSize model_size(GRBModel& model) {
-  model.update();
-  return GurobiModelSize{
+[[nodiscard]] CoptModelSize model_size(Model& model) {
+  return CoptModelSize{
       .variables = static_cast<std::size_t>(
-          model.get(GRB_IntAttr_NumVars)),
+          model.GetIntAttr(COPT_INTATTR_COLS)),
       .binary_variables = static_cast<std::size_t>(
-          model.get(GRB_IntAttr_NumBinVars)),
+          model.GetIntAttr(COPT_INTATTR_BINS)),
       .linear_constraints = static_cast<std::size_t>(
-          model.get(GRB_IntAttr_NumConstrs)),
-      .general_constraints = static_cast<std::size_t>(
-          model.get(GRB_IntAttr_NumGenConstrs)),
+          model.GetIntAttr(COPT_INTATTR_ROWS)),
+      .sos_constraints = static_cast<std::size_t>(
+          model.GetIntAttr(COPT_INTATTR_SOSS)),
       .linear_nonzeros = static_cast<std::size_t>(
-          model.get(GRB_IntAttr_NumNZs))};
+          model.GetIntAttr(COPT_INTATTR_ELEMS))};
 }
 
-[[nodiscard]] bool finite_gurobi_value(double value) {
-  return std::isfinite(value) && std::abs(value) < GRB_INFINITY;
-}
+using detail::finite_copt_value;
 
 [[nodiscard]] std::optional<double> finite_optional(double value) {
-  return finite_gurobi_value(value) ? std::optional<double>(value)
+  return finite_copt_value(value) ? std::optional<double>(value)
                                     : std::nullopt;
 }
 
@@ -118,11 +119,57 @@ void apply_time_budget(GRBModel& model, const ModelTimeBudget& budget) {
              std::llround(*rounded_target_objective_h * 100.0);
 }
 
-[[nodiscard]] double rounded_target_stop_value(double target_h) {
-  const double first_failing_value =
-      (static_cast<double>(std::llround(target_h * 100.0)) + 0.5) / 100.0;
-  return std::nextafter(first_failing_value,
-                        -std::numeric_limits<double>::infinity());
+struct PiecewiseCurve {
+  std::vector<double> knots;
+  std::vector<Var> weights;
+
+  void set_start(Model& model, double input, bool active = true) const {
+    if (!active) {
+      for (const Var& weight : weights) model.SetMipStart(weight, 0.0);
+      return;
+    }
+    std::vector<double> values(knots.size(), 0.0);
+    input = std::clamp(input, knots.front(), knots.back());
+    auto upper = std::upper_bound(knots.begin(), knots.end(), input);
+    if (upper == knots.end()) {
+      values.back() = 1.0;
+    } else {
+      const auto right = static_cast<std::size_t>(upper - knots.begin());
+      const auto left = right - 1;
+      values[right] = (input - knots[left]) / (knots[right] - knots[left]);
+      values[left] = 1.0 - values[right];
+    }
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+      model.SetMipStart(weights[i], values[i]);
+    }
+  }
+};
+
+[[nodiscard]] PiecewiseCurve add_piecewise_curve(
+    Model& model, const Var& input, const Var& output,
+    const Var& selected, int count,
+    const double* x, const double* y, const std::string& name) {
+  PiecewiseCurve curve;
+  curve.knots.assign(x, x + count);
+  VarArray sos;
+  Expr sum = 0.0, input_sum = 0.0, output_sum = 0.0;
+  for (int i = 0; i < count; ++i) {
+    Var weight = model.AddVar(0.0, 1.0, 0.0, COPT_CONTINUOUS,
+                             (name + "_weight_" + std::to_string(i)).c_str());
+    curve.weights.push_back(weight);
+    sos.PushBack(weight);
+    sum += weight;
+    input_sum += x[i] * weight;
+    output_sum += y[i] * weight;
+  }
+  // Froger (2019) FRVCP (97)-(98), (104)-(105): both PWL graphs
+  // are scaled by path selection. Inactive paths have *all* weights zero,
+  // not a unit weight at the zero-energy knot. Keep the per-path graph.
+  model.AddConstr(sum == selected, (name + "_sum").c_str());
+  model.AddConstr(input == input_sum, (name + "_input").c_str());
+  model.AddConstr(output == output_sum, (name + "_output").c_str());
+  model.AddSos(sos, x, COPT_SOS_TYPE2);
+  return curve;
 }
 
 struct FrvcpRouteLowerBound {
@@ -216,10 +263,27 @@ void saturating_add(std::size_t& value, std::size_t increment) {
          left.travel_time_h <= right.travel_time_h + kTimeToleranceH;
 }
 
+// Optimistic marginal charging rate across the whole Montoya instance.
+// An instantaneous positive-energy segment gives an infinite upper rate.
+[[nodiscard]] double maximum_charging_rate(const Instance& instance) {
+  double maximum = 0.0;
+  for (const int station_id : instance.station_ids()) {
+    const auto& points = instance.curve_for_station(station_id).points();
+    for (std::size_t index = 1; index < points.size(); ++index) {
+      const double energy = points[index].energy_wh - points[index - 1].energy_wh;
+      if (energy <= 0.0) continue;
+      const double time = points[index].time_h - points[index - 1].time_h;
+      if (time <= 1e-15) return std::numeric_limits<double>::infinity();
+      maximum = std::max(maximum, energy / time);
+    }
+  }
+  return maximum;
+}
+
 [[nodiscard]] FrvcpPathCatalog enumerate_frvcp_paths(
     const Instance& instance, const std::vector<int>& anchors,
     const std::vector<std::vector<int>>* incumbent_gaps,
-    double route_objective_upper_bound_h, GurobiDeadline deadline) {
+    double route_objective_upper_bound_h, CoptDeadline deadline) {
   FrvcpPathCatalog result;
   result.size.customer_count = anchors.size() - 2;
   result.size.gap_count = anchors.size() - 1;
@@ -441,12 +505,80 @@ void saturating_add(std::size_t& value, std::size_t increment) {
                        std::tuple{right.travel_time_h, right.stations.size(),
                                   right.stations};
               });
-    saturating_add(result.size.active_paths, gap.paths.size());
-    for (const FrvcpPathSpec& path_spec : gap.paths) {
-      saturating_add(result.size.active_station_visits,
-                     path_spec.stations.size());
-    }
     result.gaps.push_back(std::move(gap));
+  }
+
+  // TRC 4.2 / Froger 5.1: a noncharging customer couples the legs before
+  // and after it. Apply necessary feasibility conditions AFTER the existing
+  // dominance pass; do not revive paths discarded by the paper's rule.
+  if (result.complete) {
+    const int depot = instance.depot().id;
+    for (FrvcpGapPathCatalog& gap : result.gaps) {
+      double into_origin = instance.energy_wh(depot, gap.origin);
+      double out_of_target = instance.energy_wh(gap.target, depot);
+      for (const int station : stations) {
+        into_origin = std::min(into_origin, instance.energy_wh(station, gap.origin));
+        out_of_target = std::min(out_of_target, instance.energy_wh(gap.target, station));
+      }
+      std::erase_if(gap.paths, [&](const FrvcpPathSpec& path_spec) {
+        if (path_spec.required_for_start) return false;
+        if (path_spec.stations.empty()) {
+          return into_origin + path_spec.leg_energy_wh.front() + out_of_target >
+                 capacity + kEnergyToleranceWh;
+        }
+        return into_origin + path_spec.leg_energy_wh.front() > capacity + kEnergyToleranceWh ||
+               path_spec.leg_energy_wh.back() + out_of_target > capacity + kEnergyToleranceWh;
+      });
+    }
+
+    // A path must also fit into a full route, even if every other gap takes
+    // its shortest surviving alternative and all charging uses the fastest
+    // possible rate. This is a hard Tmax bound, not an incumbent-quality cap.
+    const bool nonempty = std::all_of(result.gaps.begin(), result.gaps.end(),
+        [](const auto& gap) { return !gap.paths.empty(); });
+    if (nonempty) {
+      std::vector<double> minimum_travel, minimum_energy;
+      double total_travel = 0.0, total_energy = 0.0, service = 0.0;
+      for (std::size_t i = 1; i + 1 < anchors.size(); ++i) {
+        service += instance.node(anchors[i]).service_time_h;
+      }
+      for (const auto& gap : result.gaps) {
+        double travel = std::numeric_limits<double>::infinity();
+        double energy = std::numeric_limits<double>::infinity();
+        for (const auto& path_spec : gap.paths) {
+          travel = std::min(travel, path_spec.travel_time_h);
+          energy = std::min(energy, std::accumulate(path_spec.leg_energy_wh.begin(),
+                                                   path_spec.leg_energy_wh.end(), 0.0));
+        }
+        minimum_travel.push_back(travel);
+        minimum_energy.push_back(energy);
+        total_travel += travel;
+        total_energy += energy;
+      }
+      const double maximum_rate = maximum_charging_rate(instance);
+      for (std::size_t i = 0; i < result.gaps.size(); ++i) {
+        std::erase_if(result.gaps[i].paths, [&](const FrvcpPathSpec& path_spec) {
+          if (path_spec.required_for_start) return false;
+          const double travel = total_travel - minimum_travel[i] + path_spec.travel_time_h;
+          const double energy = total_energy - minimum_energy[i] +
+              std::accumulate(path_spec.leg_energy_wh.begin(), path_spec.leg_energy_wh.end(), 0.0);
+          const double required = std::max(0.0, energy - capacity);
+          const double charging = required <= kEnergyToleranceWh ? 0.0 :
+              maximum_rate > 0.0 ? required / maximum_rate :
+              std::numeric_limits<double>::infinity();
+          return travel + charging + service >
+                 instance.vehicle().max_route_duration_h + kTimeToleranceH;
+        });
+      }
+    }
+  }
+  // Enumerated counts retain the original work; active counts describe only
+  // the final model. Stable erasure preserves surviving path/tie order.
+  for (const auto& gap : result.gaps) {
+    saturating_add(result.size.active_paths, gap.paths.size());
+    for (const auto& path_spec : gap.paths) {
+      saturating_add(result.size.active_station_visits, path_spec.stations.size());
+    }
   }
   result.size.candidate_station_copies =
       result.size.enumerated_station_visits;
@@ -486,196 +618,145 @@ void saturating_add(std::size_t& value, std::size_t increment) {
                                 .service_time_h = service_time_h};
   }
 
-  double maximum_rate_wh_per_h = 0.0;
-  bool zero_time_charge_segment = false;
-  for (const int station_id : instance.station_ids()) {
-    const std::vector<ChargingPoint>& points =
-        instance.curve_for_station(station_id).points();
-    for (std::size_t index = 1; index < points.size(); ++index) {
-      const double energy_delta =
-          points[index].energy_wh - points[index - 1].energy_wh;
-      if (energy_delta <= kEnergyToleranceWh) continue;
-      const double time_delta =
-          points[index].time_h - points[index - 1].time_h;
-      if (time_delta <= 1e-15) {
-        zero_time_charge_segment = true;
-        break;
-      }
-      maximum_rate_wh_per_h =
-          std::max(maximum_rate_wh_per_h, energy_delta / time_delta);
-    }
-    if (zero_time_charge_segment) break;
-  }
-  const double charging_lower_bound_h =
-      zero_time_charge_segment
-          ? 0.0
-          : (maximum_rate_wh_per_h > 0.0
-                 ? required_charge_wh / maximum_rate_wh_per_h
-                 : std::numeric_limits<double>::infinity());
+  const double maximum_rate_wh_per_h = maximum_charging_rate(instance);
+  const double charging_lower_bound_h = maximum_rate_wh_per_h > 0.0
+      ? required_charge_wh / maximum_rate_wh_per_h
+      : std::numeric_limits<double>::infinity();
   return FrvcpRouteLowerBound{
       .objective_h = direct_travel_h + charging_lower_bound_h,
       .service_time_h = service_time_h};
 }
 
-class SetPartitioningCallback final : public GRBCallback {
+class SetPartitioningCallback final : public CallbackBase {
  public:
   SetPartitioningCallback(SetPartitioningProgressCallback progress,
-                          std::optional<double> rounded_target_objective_h,
-                          std::optional<double> incumbent_stall_limit_s,
-                          std::optional<double> initial_incumbent_h,
-                          double progress_interval_s,
-                          GurobiModelSize size,
-                          double model_build_runtime_s)
-      : progress_(std::move(progress)),
-        rounded_target_objective_h_(rounded_target_objective_h),
-        incumbent_stall_limit_s_(incumbent_stall_limit_s),
-        best_incumbent_h_(initial_incumbent_h),
-        last_improvement_runtime_s_(initial_incumbent_h.has_value()
-                                        ? std::optional<double>(0.0)
-                                        : std::nullopt),
-        progress_interval_s_(progress_interval_s),
-        next_progress_s_(progress_interval_s),
-        size_(size),
-        model_build_runtime_s_(model_build_runtime_s) {}
+                          std::optional<double> target,
+                          std::optional<double> stall_limit,
+                          std::optional<double> initial_incumbent,
+                          double interval, CoptModelSize size, double build_s,
+                          bool serialize_callbacks)
+      : progress_(std::move(progress)), target_(target), stall_limit_(stall_limit),
+        best_(initial_incumbent), last_improvement_(initial_incumbent.has_value()
+            ? std::optional<double>(0.0) : std::nullopt), interval_(interval),
+        next_progress_(interval), size_(size), build_s_(build_s),
+        serialize_callbacks_(serialize_callbacks) {}
 
+  void start_clock() { started_ = ModelClock::now(); }
   void rethrow_callback_error() const {
-    if (callback_error_ != nullptr) std::rethrow_exception(callback_error_);
+    if (error_) std::rethrow_exception(error_);
   }
   [[nodiscard]] bool incumbent_stall_limit_reached() const noexcept {
-    return incumbent_stall_limit_reached_;
+    return stalled_;
   }
 
  private:
   void callback() override {
-    if (callback_error_ != nullptr ||
-        (where != GRB_CB_MIP && where != GRB_CB_MIPSOL)) {
-      return;
-    }
+    // Protect our own mutable observer state when COPT uses multiple threads.
+    // Callback context validity remains the responsibility of the public API.
+    std::unique_lock<std::mutex> lock(callback_mutex_, std::defer_lock);
+    if (serialize_callbacks_) lock.lock();
+    if (error_) return;
     try {
-      const double runtime_s = getDoubleInfo(GRB_CB_RUNTIME);
-      const bool mip_solution = where == GRB_CB_MIPSOL;
-      const double incumbent_value = getDoubleInfo(
-          mip_solution ? GRB_CB_MIPSOL_OBJBST : GRB_CB_MIP_OBJBST);
-      const double bound_value = getDoubleInfo(
-          mip_solution ? GRB_CB_MIPSOL_OBJBND : GRB_CB_MIP_OBJBND);
-      const double candidate_value =
-          mip_solution ? getDoubleInfo(GRB_CB_MIPSOL_OBJ) : incumbent_value;
-      const std::optional<double> observed_incumbent =
-          finite_optional(candidate_value);
-      if (observed_incumbent.has_value() &&
-          (!best_incumbent_h_.has_value() ||
-           *observed_incumbent < *best_incumbent_h_ - kCostTolerance)) {
-        best_incumbent_h_ = observed_incumbent;
-        last_improvement_runtime_s_ = runtime_s;
+      const double runtime = wall_seconds(started_);
+      // With no stopping policy, callback values only feed periodic reporting.
+      // Avoid querying COPT at every node/relaxation between reports. Target and
+      // stall policies still inspect every callback, including improvements.
+      if (!target_ && !stall_limit_ &&
+          (!progress_ || runtime + 1e-9 < next_progress_)) {
+        return;
       }
-      const bool target_reached =
-          mip_solution && finite_gurobi_value(candidate_value) &&
-          rounded_target_reached(candidate_value,
-                                 rounded_target_objective_h_);
-      const bool stalled =
-          incumbent_stall_limit_s_.has_value() &&
-          last_improvement_runtime_s_.has_value() &&
-          runtime_s - *last_improvement_runtime_s_ + 1e-9 >=
-              *incumbent_stall_limit_s_;
-
-      const std::optional<double> incumbent =
-          best_incumbent_h_.has_value() ? best_incumbent_h_
-                                        : finite_optional(incumbent_value);
-      const std::optional<double> bound = finite_optional(bound_value);
-      if (progress_ &&
-          (stalled || runtime_s + 1e-9 >= next_progress_s_)) {
+      const bool has_incumbent = GetIntInfo(COPT_CBINFO_HASINCUMBENT) != 0;
+      const auto incumbent = has_incumbent
+          ? finite_optional(GetDblInfo(COPT_CBINFO_BESTOBJ)) : std::nullopt;
+      if (incumbent && (!best_ || *incumbent < *best_ - kCostTolerance)) {
+        best_ = incumbent;
+        last_improvement_ = runtime;
+      }
+      const bool reached = incumbent && rounded_target_reached(*incumbent, target_);
+      const bool stalled = stall_limit_ && last_improvement_ &&
+          runtime - *last_improvement_ + 1e-9 >= *stall_limit_;
+      if (progress_ && (reached || stalled || runtime + 1e-9 >= next_progress_)) {
+        const auto bound = finite_optional(GetDblInfo(COPT_CBINFO_BESTBND));
         progress_(SetPartitioningProgress{
             .event = SetPartitioningProgressEvent::Search,
-            .runtime_s = runtime_s,
-            .model_build_runtime_s = model_build_runtime_s_,
-            .incumbent_objective_h = incumbent,
-            .best_bound_h = bound,
+            .runtime_s = runtime, .model_build_runtime_s = build_s_,
+            .incumbent_objective_h = incumbent, .best_bound_h = bound,
             .relative_gap = relative_gap(incumbent, bound),
-            .explored_nodes = getDoubleInfo(
-                mip_solution ? GRB_CB_MIPSOL_NODCNT : GRB_CB_MIP_NODCNT),
-            .solution_count = getIntInfo(
-                mip_solution ? GRB_CB_MIPSOL_SOLCNT : GRB_CB_MIP_SOLCNT),
-            .rounded_target_reached = target_reached,
-            .incumbent_stall_limit_reached = stalled,
-            .model_size = size_});
-        next_progress_s_ =
-            (std::floor(runtime_s / progress_interval_s_) + 1.0) *
-            progress_interval_s_;
+            // COPT does not expose node counts through callback information.
+            .explored_nodes = std::nullopt,
+            .solution_count = has_incumbent ? 1 : 0,
+            .rounded_target_reached = reached,
+            .incumbent_stall_limit_reached = stalled, .model_size = size_});
+        next_progress_ = (std::floor(runtime / interval_) + 1.0) * interval_;
       }
-      if (stalled) {
-        incumbent_stall_limit_reached_ = true;
-        abort();
+      if (reached || stalled) {
+        stalled_ = stalled;
+        Interrupt();
       }
     } catch (...) {
-      callback_error_ = std::current_exception();
-      abort();
+      error_ = std::current_exception();
+      Interrupt();
     }
   }
-
   SetPartitioningProgressCallback progress_;
-  std::optional<double> rounded_target_objective_h_;
-  std::optional<double> incumbent_stall_limit_s_;
-  std::optional<double> best_incumbent_h_;
-  std::optional<double> last_improvement_runtime_s_;
-  double progress_interval_s_{};
-  double next_progress_s_{};
-  GurobiModelSize size_;
-  double model_build_runtime_s_{};
-  bool incumbent_stall_limit_reached_{};
-  std::exception_ptr callback_error_;
+  std::optional<double> target_, stall_limit_, best_, last_improvement_;
+  double interval_{}, next_progress_{};
+  CoptModelSize size_;
+  double build_s_{};
+  bool serialize_callbacks_{};
+  std::mutex callback_mutex_;
+  ModelClock::time_point started_{};
+  bool stalled_{};
+  std::exception_ptr error_;
 };
 
 }  // namespace
 
-std::string gurobi_status_name(int status) {
+std::string copt_status_name(int status) {
   switch (status) {
-    case GRB_LOADED:
-      return "LOADED";
-    case GRB_OPTIMAL:
-      return "OPTIMAL";
-    case GRB_INFEASIBLE:
-      return "INFEASIBLE";
-    case GRB_INF_OR_UNBD:
-      return "INF_OR_UNBD";
-    case GRB_UNBOUNDED:
-      return "UNBOUNDED";
-    case GRB_TIME_LIMIT:
-      return "TIME_LIMIT";
-    case GRB_INTERRUPTED:
-      return "INTERRUPTED";
-    case GRB_NUMERIC:
-      return "NUMERIC";
-    case GRB_SUBOPTIMAL:
-      return "SUBOPTIMAL";
-    case GRB_USER_OBJ_LIMIT:
-      return "USER_OBJ_LIMIT";
-    default:
-      return "STATUS_" + std::to_string(status);
+    case COPT_STATUS_UNSTARTED: return "UNSTARTED";
+    case COPT_STATUS_OPTIMAL: return "OPTIMAL";
+    case COPT_STATUS_INFEASIBLE: return "INFEASIBLE";
+    case COPT_STATUS_UNBOUNDED: return "UNBOUNDED";
+    case COPT_STATUS_INF_OR_UNB: return "INF_OR_UNBD";
+    case COPT_STATUS_NUMERICAL: return "NUMERICAL";
+    case COPT_STATUS_NODELIMIT: return "NODE_LIMIT";
+    case COPT_STATUS_IMPRECISE: return "IMPRECISE";
+    case COPT_STATUS_TIMEOUT: return "TIME_LIMIT";
+    case COPT_STATUS_UNFINISHED: return "UNFINISHED";
+    case COPT_STATUS_INTERRUPTED: return "INTERRUPTED";
+    case COPT_STATUS_ITERLIMIT: return "ITERATION_LIMIT";
+    case COPT_STATUS_MEMLIMIT: return "MEMORY_LIMIT";
+    default: return "STATUS_" + std::to_string(status);
   }
 }
 
-GurobiSetPartitioning::GurobiSetPartitioning(const Instance& instance,
-                                             GRBEnv& environment,
-                                             GurobiConfig config)
+CoptSetPartitioning::CoptSetPartitioning(const Instance& instance,
+                                             Envr& environment,
+                                             CoptConfig config)
     : instance_(instance), environment_(environment), config_(config) {
-  if (config_.threads < 1 || !std::isfinite(config_.mip_gap) ||
+  if (config_.threads < 1 ||
+      (config_.sp_integer_threads &&
+       (*config_.sp_integer_threads < 1 || *config_.sp_integer_threads > 128)) ||
+      !std::isfinite(config_.mip_gap) ||
       config_.mip_gap < 0.0 ||
       (config_.time_limit_s.has_value() &&
        (!std::isfinite(*config_.time_limit_s) ||
         *config_.time_limit_s <= 0.0))) {
-    throw std::invalid_argument("invalid Gurobi configuration");
+    throw std::invalid_argument("invalid Copt configuration");
   }
 }
 
-void GurobiSetPartitioning::configure(GRBModel& model, bool integer) const {
-  model.set(GRB_IntParam_OutputFlag, config_.output_flag);
-  model.set(GRB_IntParam_Threads, config_.threads);
-  model.set(GRB_IntParam_Seed, config_.seed);
-  if (integer) model.set(GRB_DoubleParam_MIPGap, config_.mip_gap);
+void CoptSetPartitioning::configure(Model& model, bool integer) const {
+  model.SetIntParam(COPT_INTPARAM_LOGGING, config_.output_flag);
+  model.SetIntParam(COPT_INTPARAM_THREADS,
+                    integer ? config_.sp_integer_threads.value_or(config_.threads)
+                            : config_.threads);
+  if (integer) model.SetDblParam(COPT_DBLPARAM_RELGAP, config_.mip_gap);
 }
 
 std::vector<std::vector<std::size_t>>
-GurobiSetPartitioning::customer_incidence(
+CoptSetPartitioning::customer_incidence(
     const std::vector<RouteColumn>& columns) const {
   if (columns.empty()) {
     throw std::invalid_argument("set partitioning needs at least one column");
@@ -690,6 +771,9 @@ GurobiSetPartitioning::customer_incidence(
   std::vector<std::vector<std::size_t>> incidence(customers.size());
   for (std::size_t column_index = 0; column_index < columns.size();
        ++column_index) {
+    if (!finite_copt_value(columns[column_index].cost_h)) {
+      throw std::invalid_argument("route column cost must be finite");
+    }
     for (const int customer_id : columns[column_index].customer_set) {
       const auto row = row_by_customer.find(customer_id);
       if (row == row_by_customer.end()) {
@@ -708,7 +792,7 @@ GurobiSetPartitioning::customer_incidence(
   return incidence;
 }
 
-SetPartitioningResult GurobiSetPartitioning::solve_integer(
+SetPartitioningResult CoptSetPartitioning::solve_integer(
     const std::vector<RouteColumn>& columns,
     SetPartitioningSolveOptions options) {
   const auto call_started = ModelClock::now();
@@ -725,69 +809,102 @@ SetPartitioningResult GurobiSetPartitioning::solve_integer(
         *options.maximum_wall_time_s <= 0.0))) {
     throw std::invalid_argument("invalid set-partitioning solve options");
   }
-  const GurobiDeadline deadline = bounded_deadline(
+  const CoptDeadline deadline = bounded_deadline(
       call_started, options.deadline, options.maximum_wall_time_s);
   const std::vector<std::vector<std::size_t>> incidence =
       customer_incidence(columns);
-  if (model_time_budget(config_, deadline).expired) {
-    return time_limit_result<SetPartitioningResult>(call_started);
-  }
-  GRBModel model(environment_);
-  model.set(GRB_StringAttr_ModelName, "ils_sp_partition_" + instance_.name());
-  configure(model, true);
-  std::vector<GRBVar> theta;
-  theta.reserve(columns.size());
-  for (std::size_t index = 0; index < columns.size(); ++index) {
-    if ((index & 255U) == 0U && deadline_exhausted(deadline)) {
-      return time_limit_result<SetPartitioningResult>(call_started);
-    }
-    theta.push_back(model.addVar(0.0, 1.0, columns[index].cost_h, GRB_BINARY,
-                                 "theta_" + std::to_string(index)));
-  }
-  if (deadline_exhausted(deadline)) {
-    return time_limit_result<SetPartitioningResult>(call_started);
-  }
-  const std::vector<int>& customers = instance_.customer_ids();
-  for (std::size_t row = 0; row < customers.size(); ++row) {
-    if (deadline_exhausted(deadline)) {
-      return time_limit_result<SetPartitioningResult>(call_started);
-    }
-    GRBLinExpr cover = 0.0;
-    for (const std::size_t column_index : incidence[row]) {
-      cover += theta[column_index];
-    }
-    model.addConstr(cover == 1.0,
-                    "cover_" + std::to_string(customers[row]));
-  }
-
+  std::vector<bool> selected_start(columns.size(), false);
   std::optional<double> mip_start_objective_h;
   if (!options.mip_start_indices.empty()) {
-    std::vector<bool> selected(columns.size(), false);
     for (const std::size_t index : options.mip_start_indices) {
-      if (index >= columns.size() || selected[index]) {
+      if (index >= columns.size() || selected_start[index]) {
         throw std::invalid_argument("invalid duplicate SP MIP-start column");
       }
-      selected[index] = true;
+      selected_start[index] = true;
     }
     for (const std::vector<std::size_t>& covering_columns : incidence) {
       const std::size_t count = static_cast<std::size_t>(std::count_if(
           covering_columns.begin(), covering_columns.end(),
-          [&](std::size_t index) { return selected[index]; }));
+          [&](std::size_t index) { return selected_start[index]; }));
       if (count != 1) {
         throw std::invalid_argument(
             "SP MIP start is not an exact customer partition");
       }
     }
     double objective_h = 0.0;
+    Solution start_solution;
     for (std::size_t index = 0; index < columns.size(); ++index) {
-      theta[index].set(GRB_DoubleAttr_Start, selected[index] ? 1.0 : 0.0);
-      if (selected[index]) objective_h += columns[index].cost_h;
+      if (selected_start[index]) {
+        const Plan& plan = columns[index].plan;
+        if (!plan.evaluation || !plan.evaluation->feasible) {
+          throw std::invalid_argument("SP MIP start contains an infeasible plan");
+        }
+        start_solution.plans.push_back(plan);
+        objective_h += columns[index].cost_h;
+      }
+    }
+    start_solution.validate_partition(instance_);
+    if (!finite_copt_value(objective_h)) {
+      throw std::invalid_argument("SP MIP-start objective must be finite");
     }
     mip_start_objective_h = objective_h;
   }
 
-  model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
-  const GurobiModelSize size = model_size(model);
+  const auto retained_start = [&](int status) {
+    SetPartitioningResult result;
+    result.status = status;
+    result.status_name = copt_status_name(status);
+    result.wall_runtime_s = wall_seconds(call_started);
+    result.mip_start_routes = options.mip_start_indices.size();
+    result.mip_start_objective_h = mip_start_objective_h;
+    // This is the validated application incumbent, not a backend solution.
+    // Keep solution_count=0 when COPT has not supplied a usable solution.
+    if (mip_start_objective_h) {
+      result.objective_h = mip_start_objective_h;
+      for (const std::size_t index : options.mip_start_indices) {
+        result.selected_columns.push_back(columns[index]);
+      }
+      result.rounded_target_reached = rounded_target_reached(
+          *mip_start_objective_h, options.rounded_target_objective_h);
+    }
+    return result;
+  };
+  if (model_time_budget(config_, deadline).expired) {
+    return retained_start(COPT_STATUS_TIMEOUT);
+  }
+  Model model = environment_.CreateModel(("ils_sp_partition_" + instance_.name()).c_str());
+  configure(model, true);
+  std::vector<Var> theta;
+  theta.reserve(columns.size());
+  for (std::size_t index = 0; index < columns.size(); ++index) {
+    if ((index & 255U) == 0U && deadline_exhausted(deadline)) {
+      return retained_start(COPT_STATUS_TIMEOUT);
+    }
+    theta.push_back(model.AddVar(0.0, 1.0, columns[index].cost_h, COPT_BINARY, ("theta_" + std::to_string(index)).c_str()));
+  }
+  if (deadline_exhausted(deadline)) {
+    return retained_start(COPT_STATUS_TIMEOUT);
+  }
+  const std::vector<int>& customers = instance_.customer_ids();
+  for (std::size_t row = 0; row < customers.size(); ++row) {
+    if (deadline_exhausted(deadline)) {
+      return retained_start(COPT_STATUS_TIMEOUT);
+    }
+    Expr cover = 0.0;
+    for (const std::size_t column_index : incidence[row]) {
+      cover += theta[column_index];
+    }
+    model.AddConstr(cover == 1.0, ("cover_" + std::to_string(customers[row])).c_str());
+  }
+
+  if (mip_start_objective_h) {
+    for (std::size_t index = 0; index < columns.size(); ++index) {
+      model.SetMipStart(theta[index], selected_start[index] ? 1.0 : 0.0);
+    }
+  }
+
+  model.SetObjSense(COPT_MINIMIZE);
+  const CoptModelSize size = model_size(model);
   const double model_build_runtime_s = wall_seconds(call_started);
   if (options.progress) {
     options.progress(SetPartitioningProgress{
@@ -803,10 +920,10 @@ SetPartitioningResult GurobiSetPartitioning::solve_integer(
         .incumbent_stall_limit_reached = false,
         .model_size = size});
   }
-  const ModelTimeBudget budget = model_time_budget(config_, deadline);
+  ModelTimeBudget budget = model_time_budget(config_, deadline);
   if (budget.expired) {
     SetPartitioningResult result =
-        time_limit_result<SetPartitioningResult>(call_started);
+        retained_start(COPT_STATUS_TIMEOUT);
     result.model_build_runtime_s = model_build_runtime_s;
     result.mip_start_routes = options.mip_start_indices.size();
     result.mip_start_objective_h = mip_start_objective_h;
@@ -814,32 +931,53 @@ SetPartitioningResult GurobiSetPartitioning::solve_integer(
     return result;
   }
   apply_time_budget(model, budget);
-  if (options.rounded_target_objective_h.has_value()) {
-    model.set(GRB_DoubleParam_BestObjStop,
-              rounded_target_stop_value(
-                  *options.rounded_target_objective_h));
-  }
   SetPartitioningCallback callback(
       options.progress, options.rounded_target_objective_h,
       options.incumbent_stall_limit_s, mip_start_objective_h,
-      options.progress_interval_s, size, model_build_runtime_s);
-  if (options.progress || options.incumbent_stall_limit_s.has_value()) {
-    model.setCallback(&callback);
+      options.progress_interval_s, size, model_build_runtime_s,
+      config_.sp_integer_threads.value_or(config_.threads) > 1);
+  if (options.progress || options.incumbent_stall_limit_s.has_value() ||
+      options.rounded_target_objective_h.has_value()) {
+    model.SetCallback(&callback, COPT_CBCONTEXT_INCUMBENT |
+                      COPT_CBCONTEXT_MIPNODE | COPT_CBCONTEXT_MIPRELAX);
   }
-  model.optimize();
+  if (mip_start_objective_h) model.LoadMipStart();
+  budget = model_time_budget(config_, deadline);
+  if (budget.expired) {
+    SetPartitioningResult result = retained_start(COPT_STATUS_TIMEOUT);
+    result.model_build_runtime_s = model_build_runtime_s;
+    result.model_size = size;
+    return result;
+  }
+  apply_time_budget(model, budget);
+  callback.start_clock();
+  model.Solve();
   callback.rethrow_callback_error();
-  const int status = model.get(GRB_IntAttr_Status);
-  const int solution_count = model.get(GRB_IntAttr_SolCount);
+  const int status = model.GetIntAttr(COPT_INTATTR_STATUS);
+  const int solution_count = model.GetIntAttr(COPT_INTATTR_HASSOL);
   const std::optional<double> objective_h =
       solution_count > 0
-          ? std::optional<double>(model.get(GRB_DoubleAttr_ObjVal))
+          ? std::optional<double>(model.GetDblAttr(COPT_DBLATTR_OBJVAL))
           : std::nullopt;
+  const bool invalid_objective = objective_h && !finite_copt_value(*objective_h);
+  const bool stopped_without_solution = solution_count == 0 &&
+      (status == COPT_STATUS_TIMEOUT || status == COPT_STATUS_INTERRUPTED ||
+       status == COPT_STATUS_IMPRECISE || status == COPT_STATUS_NUMERICAL);
+  if (invalid_objective || stopped_without_solution) {
+    SetPartitioningResult result = retained_start(
+        invalid_objective ? COPT_STATUS_NUMERICAL : status);
+    result.runtime_s = model.GetDblAttr(COPT_DBLATTR_SOLVINGTIME);
+    result.model_build_runtime_s = model_build_runtime_s;
+    result.applied_time_limit_s = budget.applied_time_limit_s;
+    result.model_size = size;
+    return result;
+  }
   const std::optional<double> best_bound_h =
-      finite_optional(model.get(GRB_DoubleAttr_ObjBound));
+      finite_optional(model.GetDblAttr(COPT_DBLATTR_BESTBND));
   std::vector<RouteColumn> selected;
   if (solution_count > 0) {
     for (std::size_t index = 0; index < columns.size(); ++index) {
-      if (theta[index].get(GRB_DoubleAttr_X) > 0.5) {
+      if (theta[index].Get(COPT_DBLINFO_VALUE) > 0.5) {
         selected.push_back(columns[index]);
       }
     }
@@ -851,16 +989,16 @@ SetPartitioningResult GurobiSetPartitioning::solve_integer(
   }
   return SetPartitioningResult{
       .status = status,
-      .status_name = gurobi_status_name(status),
+      .status_name = copt_status_name(status),
       .selected_columns = std::move(selected),
       .objective_h = objective_h,
-      .runtime_s = model.get(GRB_DoubleAttr_Runtime),
+      .runtime_s = model.GetDblAttr(COPT_DBLATTR_SOLVINGTIME),
       .wall_runtime_s = wall_seconds(call_started),
       .model_build_runtime_s = model_build_runtime_s,
       .applied_time_limit_s = budget.applied_time_limit_s,
       .best_bound_h = best_bound_h,
       .relative_gap = relative_gap(objective_h, best_bound_h),
-      .explored_nodes = model.get(GRB_DoubleAttr_NodeCount),
+      .explored_nodes = static_cast<double>(model.GetIntAttr(COPT_INTATTR_NODECNT)),
       .solution_count = solution_count,
       .mip_start_routes = options.mip_start_indices.size(),
       .mip_start_objective_h = mip_start_objective_h,
@@ -873,48 +1011,43 @@ SetPartitioningResult GurobiSetPartitioning::solve_integer(
       .model_size = size};
 }
 
-LinearRelaxationResult GurobiSetPartitioning::solve_relaxation(
-    const std::vector<RouteColumn>& columns, GurobiDeadline deadline) {
+LinearRelaxationResult CoptSetPartitioning::solve_relaxation(
+    const std::vector<RouteColumn>& columns, CoptDeadline deadline) {
   const auto call_started = ModelClock::now();
   const std::vector<std::vector<std::size_t>> incidence =
       customer_incidence(columns);
   if (model_time_budget(config_, deadline).expired) {
     return time_limit_result<LinearRelaxationResult>(call_started);
   }
-  GRBModel model(environment_);
-  model.set(GRB_StringAttr_ModelName,
-            "ils_sp_partition_lp_" + instance_.name());
+  Model model = environment_.CreateModel(("ils_sp_partition_lp_" + instance_.name()).c_str());
   configure(model, false);
-  std::vector<GRBVar> theta;
+  std::vector<Var> theta;
   theta.reserve(columns.size());
   for (std::size_t index = 0; index < columns.size(); ++index) {
     if ((index & 255U) == 0U && deadline_exhausted(deadline)) {
       return time_limit_result<LinearRelaxationResult>(call_started);
     }
-    theta.push_back(model.addVar(0.0, 1.0, columns[index].cost_h,
-                                 GRB_CONTINUOUS,
-                                 "theta_" + std::to_string(index)));
+    theta.push_back(model.AddVar(0.0, 1.0, columns[index].cost_h, COPT_CONTINUOUS, ("theta_" + std::to_string(index)).c_str()));
   }
   if (deadline_exhausted(deadline)) {
     return time_limit_result<LinearRelaxationResult>(call_started);
   }
-  std::unordered_map<int, GRBConstr> cover_constraints;
+  std::unordered_map<int, Constraint> cover_constraints;
   const std::vector<int>& customers = instance_.customer_ids();
   for (std::size_t row = 0; row < customers.size(); ++row) {
     if (deadline_exhausted(deadline)) {
       return time_limit_result<LinearRelaxationResult>(call_started);
     }
-    GRBLinExpr cover = 0.0;
+    Expr cover = 0.0;
     for (const std::size_t column_index : incidence[row]) {
       cover += theta[column_index];
     }
     cover_constraints.emplace(
         customers[row],
-        model.addConstr(cover == 1.0,
-                        "cover_" + std::to_string(customers[row])));
+        model.AddConstr(cover == 1.0, ("cover_" + std::to_string(customers[row])).c_str()));
   }
-  model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE);
-  const GurobiModelSize size = model_size(model);
+  model.SetObjSense(COPT_MINIMIZE);
+  const CoptModelSize size = model_size(model);
   const ModelTimeBudget budget = model_time_budget(config_, deadline);
   if (budget.expired) {
     LinearRelaxationResult result =
@@ -923,68 +1056,78 @@ LinearRelaxationResult GurobiSetPartitioning::solve_relaxation(
     return result;
   }
   apply_time_budget(model, budget);
-  model.optimize();
-  const int status = model.get(GRB_IntAttr_Status);
+  model.Solve();
+  int status = model.GetIntAttr(COPT_INTATTR_STATUS);
   std::unordered_map<int, double> duals;
-  if (status == GRB_OPTIMAL) {
+  std::optional<double> objective_h;
+  if (status == COPT_STATUS_OPTIMAL) {
+    objective_h = finite_optional(model.GetDblAttr(COPT_DBLATTR_OBJVAL));
     for (auto& [customer_id, constraint] : cover_constraints) {
-      duals.emplace(customer_id, constraint.get(GRB_DoubleAttr_Pi));
+      const double dual = constraint.Get(COPT_DBLINFO_DUAL);
+      if (!finite_copt_value(dual)) {
+        status = COPT_STATUS_NUMERICAL;
+        break;
+      }
+      duals.emplace(customer_id, dual);
+    }
+    if (!objective_h || status != COPT_STATUS_OPTIMAL) {
+      status = COPT_STATUS_NUMERICAL;
+      objective_h.reset();
+      duals.clear();
     }
   }
   return LinearRelaxationResult{
       .status = status,
-      .status_name = gurobi_status_name(status),
-      .objective_h = status == GRB_OPTIMAL
-                         ? std::optional<double>(
-                               model.get(GRB_DoubleAttr_ObjVal))
-                         : std::nullopt,
+      .status_name = copt_status_name(status),
+      .objective_h = objective_h,
       .duals = std::move(duals),
-      .runtime_s = model.get(GRB_DoubleAttr_Runtime),
+      .runtime_s = model.GetDblAttr(COPT_DBLATTR_SOLVINGTIME),
       .wall_runtime_s = wall_seconds(call_started),
       .applied_time_limit_s = budget.applied_time_limit_s,
       .model_size = size};
 }
 
-GurobiFrvcp::GurobiFrvcp(const Instance& instance, RouteEvaluator& evaluator,
-                         PlanFactory& factory, GRBEnv& environment,
-                         GurobiConfig config,
+CoptFrvcp::CoptFrvcp(const Instance& instance, RouteEvaluator& evaluator,
+                         PlanFactory& factory, Envr& environment,
+                         CoptConfig config,
                          std::size_t infeasible_cache_capacity)
     : instance_(instance),
       evaluator_(evaluator),
       factory_(factory),
       environment_(environment),
       config_(config),
-      infeasible_cache_(infeasible_cache_capacity) {
+      model_cache_(infeasible_cache_capacity) {
   if (config_.threads < 1 || !std::isfinite(config_.mip_gap) ||
       config_.mip_gap < 0.0 ||
       (config_.time_limit_s.has_value() &&
        (!std::isfinite(*config_.time_limit_s) ||
         *config_.time_limit_s <= 0.0))) {
-    throw std::invalid_argument("invalid FRVCP Gurobi configuration");
+    throw std::invalid_argument("invalid FRVCP Copt configuration");
   }
 }
 
-void GurobiFrvcp::configure(GRBModel& model) const {
-  model.set(GRB_IntParam_OutputFlag, config_.output_flag);
-  model.set(GRB_IntParam_Threads, config_.threads);
-  model.set(GRB_IntParam_Seed, config_.seed);
-  model.set(GRB_DoubleParam_MIPGap, config_.mip_gap);
+void CoptFrvcp::configure(Model& model) const {
+  model.SetIntParam(COPT_INTPARAM_LOGGING, config_.output_flag);
+  model.SetIntParam(COPT_INTPARAM_THREADS, config_.threads);
+  model.SetDblParam(COPT_DBLPARAM_RELGAP, config_.mip_gap);
 }
 
-FrvcpResult GurobiFrvcp::optimize(
-    const std::vector<int>& customer_ids, GurobiDeadline deadline) {
-  return optimize_impl(customer_ids, nullptr, deadline);
+FrvcpResult CoptFrvcp::optimize(
+    const std::vector<int>& customer_ids, CoptDeadline deadline,
+    FrvcpProgressCallback progress) {
+  return optimize_impl(customer_ids, nullptr, deadline, progress);
 }
 
-FrvcpResult GurobiFrvcp::optimize(const Plan& incumbent_plan,
-                                  GurobiDeadline deadline) {
+FrvcpResult CoptFrvcp::optimize(const Plan& incumbent_plan,
+                                  CoptDeadline deadline,
+                                  FrvcpProgressCallback progress) {
   return optimize_impl(incumbent_plan.customer_ids, &incumbent_plan,
-                       deadline);
+                       deadline, progress);
 }
 
-FrvcpResult GurobiFrvcp::optimize_impl(
+FrvcpResult CoptFrvcp::optimize_impl(
     const std::vector<int>& customer_ids, const Plan* incumbent_plan,
-    GurobiDeadline deadline) {
+    CoptDeadline deadline, const FrvcpProgressCallback& progress) {
   const auto call_started = ModelClock::now();
   if (customer_ids.empty() ||
       sorted_customer_set(customer_ids).size() != customer_ids.size()) {
@@ -996,7 +1139,8 @@ FrvcpResult GurobiFrvcp::optimize_impl(
        incumbent_plan->route !=
            expand_route(customer_ids, incumbent_plan->gaps) ||
        incumbent_plan->evaluation == nullptr ||
-       !incumbent_plan->evaluation->feasible)) {
+       !incumbent_plan->evaluation->feasible ||
+       !finite_copt_value(incumbent_plan->evaluation->raw_cost_h))) {
     throw std::invalid_argument("FRVCP MIP start must be a feasible plan for "
                                 "the same customer order");
   }
@@ -1008,7 +1152,7 @@ FrvcpResult GurobiFrvcp::optimize_impl(
           : std::nullopt;
   const auto exact_result = [&](Plan plan) {
     const double objective = plan.evaluation->raw_cost_h;
-    return FrvcpResult{.status = GRB_OPTIMAL,
+    return FrvcpResult{.status = COPT_STATUS_OPTIMAL,
                        .status_name = "OPTIMAL",
                        .plan = std::move(plan),
                        .model_objective_h = objective,
@@ -1027,31 +1171,35 @@ FrvcpResult GurobiFrvcp::optimize_impl(
     ++cache_hits_;
     return exact_result(std::move(*exact));
   }
-  // TRC marks an optimized route so that it is never optimized again.  The
-  // label remains a certificate even if the bounded ordered-route LRU evicts
-  // its entry; restore that entry without rebuilding a model.
+  // This label now requires an independent fixed-customer-order certificate,
+  // rather than OPTIMAL on the incumbent-dependent TRC-pruned path set.
   if (incumbent_plan != nullptr && incumbent_plan->exact_charging) {
     factory_.publish_exact(*incumbent_plan);
     ++cache_hits_;
     return exact_result(*incumbent_plan);
   }
-  if (auto infeasible = infeasible_cache_.get(customer_ids);
-      infeasible.has_value()) {
+  const ModelRequest request{
+      .customers = customer_ids,
+      .incumbent_visits = incumbent_plan != nullptr
+          ? std::optional<std::vector<int>>(incumbent_plan->route.visits)
+          : std::nullopt,
+      .objective_upper_bound_bits = std::bit_cast<std::uint64_t>(
+          incumbent_plan != nullptr ? incumbent_plan->evaluation->raw_cost_h
+              : instance_.vehicle().max_route_duration_h - lower_bound.service_time_h)};
+  if (auto cached = model_cache_.get(request); cached.has_value()) {
     ++cache_hits_;
-    return FrvcpResult{.status = GRB_INFEASIBLE,
-                       .status_name = "INFEASIBLE",
-                       .plan = std::nullopt,
-                       .model_objective_h = std::nullopt,
-                       .runtime_s = 0.0,
-                       .wall_runtime_s = wall_seconds(call_started),
-                       .cache_hit = true,
-                       .applied_time_limit_s = std::nullopt,
-                       .objective_lower_bound_h = finite_lower_bound,
-                       .mip_start_objective_h = std::nullopt,
-                       .model_size = {},
-                       .network_size = FrvcpNetworkSize{
-                           .customer_count = customer_ids.size(),
-                           .gap_count = customer_ids.size() + 1}};
+    cached->runtime_s = 0.0;
+    cached->wall_runtime_s = wall_seconds(call_started);
+    cached->path_generation_runtime_s = 0.0;
+    cached->model_build_runtime_s = 0.0;
+    cached->cache_hit = true;
+    cached->applied_time_limit_s = std::nullopt;
+    cached->mip_start_objective_h = std::nullopt;
+    cached->mip_start_supplied = false;
+    cached->model_size = {};
+    cached->network_size = FrvcpNetworkSize{
+        .customer_count = customer_ids.size(), .gap_count = customer_ids.size() + 1};
+    return *cached;
   }
 
   // With Euclidean travel, each direct anchor leg is a shortest path.  If the
@@ -1064,7 +1212,7 @@ FrvcpResult GurobiFrvcp::optimize_impl(
     direct.exact_charging = true;
     const double objective = direct.evaluation->raw_cost_h;
     factory_.publish_exact(direct);
-    return FrvcpResult{.status = GRB_OPTIMAL,
+    return FrvcpResult{.status = COPT_STATUS_OPTIMAL,
                        .status_name = "OPTIMAL",
                        .plan = std::move(direct),
                        .model_objective_h = objective,
@@ -1086,8 +1234,7 @@ FrvcpResult GurobiFrvcp::optimize_impl(
   if (!std::isfinite(lower_bound.objective_h) ||
       lower_bound.objective_h + lower_bound.service_time_h >
           instance_.vehicle().max_route_duration_h + kTimeToleranceH) {
-    infeasible_cache_.put(customer_ids, true);
-    return FrvcpResult{.status = GRB_INFEASIBLE,
+    FrvcpResult certificate{.status = COPT_STATUS_INFEASIBLE,
                        .status_name = "INFEASIBLE",
                        .plan = std::nullopt,
                        .model_objective_h = std::nullopt,
@@ -1104,22 +1251,25 @@ FrvcpResult GurobiFrvcp::optimize_impl(
                        .network_size = FrvcpNetworkSize{
                            .customer_count = customer_ids.size(),
                            .gap_count = customer_ids.size() + 1}};
+    model_cache_.put(request, certificate);
+    return certificate;
   }
   ++solve_calls_;
   FrvcpResult result = solve(customer_ids, incumbent_plan,
-                             lower_bound.objective_h, deadline);
-  if (result.status == GRB_INFEASIBLE) {
-    infeasible_cache_.put(customer_ids, true);
+                             lower_bound.objective_h, deadline, progress);
+  if (result.status == COPT_STATUS_OPTIMAL || result.status == COPT_STATUS_INFEASIBLE) {
+    model_cache_.put(request, result);
   }
   return result;
 }
 
-FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
+FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
                                const Plan* incumbent_plan,
                                double objective_lower_bound_h,
-                               GurobiDeadline deadline) {
+                               CoptDeadline deadline,
+                               const FrvcpProgressCallback& progress) {
   const auto call_started = ModelClock::now();
-  const GurobiDeadline operation_deadline = deadline;
+  const CoptDeadline operation_deadline = deadline;
   std::vector<int> anchors;
   anchors.reserve(customer_ids.size() + 2);
   anchors.push_back(instance_.depot().id);
@@ -1145,11 +1295,11 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
   const auto terminal_result = [&](int status) {
     const bool retain_incumbent =
         incumbent_plan != nullptr &&
-        (status == GRB_TIME_LIMIT || status == GRB_INTERRUPTED ||
-         status == GRB_SUBOPTIMAL);
+        (status == COPT_STATUS_TIMEOUT || status == COPT_STATUS_INTERRUPTED ||
+         status == COPT_STATUS_IMPRECISE || status == COPT_STATUS_NUMERICAL);
     return FrvcpResult{
         .status = status,
-        .status_name = gurobi_status_name(status),
+        .status_name = copt_status_name(status),
         .plan = retain_incumbent ? std::optional<Plan>(*incumbent_plan)
                                  : std::nullopt,
         .model_objective_h =
@@ -1175,28 +1325,30 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
         .model_size = {},
         .network_size = catalog.size};
   };
-  if (!catalog.complete) return terminal_result(GRB_TIME_LIMIT);
+  if (!catalog.complete) return terminal_result(COPT_STATUS_TIMEOUT);
   if (catalog.gaps.size() != anchors.size() - 1 ||
       std::any_of(catalog.gaps.begin(), catalog.gaps.end(),
                   [](const FrvcpGapPathCatalog& gap) {
                     return gap.paths.empty();
                   })) {
-    return terminal_result(GRB_INFEASIBLE);
+    return terminal_result(COPT_STATUS_INFEASIBLE);
   }
 
   struct PathStationVariables {
     int station_id{};
-    GRBVar arrival;
-    GRBVar departure;
-    GRBVar curve_arrival;
-    GRBVar curve_departure;
-    GRBVar charge_duration;
+    Var arrival;
+    Var departure;
+    Var curve_arrival;
+    Var curve_departure;
+    Var charge_duration;
+    PiecewiseCurve arrival_curve;
+    PiecewiseCurve departure_curve;
   };
   struct PathVariables {
     const FrvcpPathSpec* spec{};
-    GRBVar selected;
-    GRBVar origin_energy;
-    GRBVar target_energy;
+    Var selected;
+    Var origin_energy;
+    Var target_energy;
     std::vector<PathStationVariables> stations;
   };
   struct GapVariables {
@@ -1208,8 +1360,7 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
   };
 
   const auto model_build_started = ModelClock::now();
-  GRBModel model(environment_);
-  model.set(GRB_StringAttr_ModelName, "frvcp_path_" + instance_.name());
+  Model model = environment_.CreateModel(("frvcp_path_" + instance_.name()).c_str());
   configure(model);
   const double capacity = instance_.vehicle().battery_capacity_wh;
   std::unordered_map<std::string, CurvePoints> curve_points;
@@ -1224,46 +1375,37 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
     curve_points.emplace(type, std::move(points));
   }
 
-  std::vector<GRBVar> anchor_energy;
+  std::vector<Var> anchor_energy;
   anchor_energy.reserve(anchors.size());
   for (std::size_t index = 0; index < anchors.size(); ++index) {
     const double lower = index == 0 ? capacity : 0.0;
-    anchor_energy.push_back(model.addVar(
-        lower, capacity, 0.0, GRB_CONTINUOUS,
-        "anchor_energy_" + std::to_string(index)));
+    anchor_energy.push_back(model.AddVar(lower, capacity, 0.0, COPT_CONTINUOUS, ("anchor_energy_" + std::to_string(index)).c_str()));
   }
 
   std::vector<GapVariables> gaps;
   gaps.reserve(catalog.gaps.size());
-  GRBLinExpr objective = 0.0;
+  Expr objective = 0.0;
   for (std::size_t gap_index = 0; gap_index < catalog.gaps.size();
        ++gap_index) {
     if (deadline_exhausted(operation_deadline)) {
-      return terminal_result(GRB_TIME_LIMIT);
+      return terminal_result(COPT_STATUS_TIMEOUT);
     }
     const FrvcpGapPathCatalog& path_catalog = catalog.gaps[gap_index];
     GapVariables gap;
     gap.paths.reserve(path_catalog.paths.size());
-    GRBLinExpr selection = 0.0;
-    GRBLinExpr origin_flow = 0.0;
-    GRBLinExpr target_flow = 0.0;
+    Expr selection = 0.0;
+    Expr origin_flow = 0.0;
+    Expr target_flow = 0.0;
     for (std::size_t path_index = 0;
          path_index < path_catalog.paths.size(); ++path_index) {
       const FrvcpPathSpec& spec = path_catalog.paths[path_index];
       const std::string suffix = std::to_string(gap_index) + "_" +
                                  std::to_string(path_index);
-      GRBVar selected = model.addVar(0.0, 1.0, 0.0, GRB_BINARY,
-                                     "path_selected_" + suffix);
-      GRBVar origin_energy = model.addVar(
-          0.0, capacity, 0.0, GRB_CONTINUOUS,
-          "path_origin_energy_" + suffix);
-      GRBVar target_energy = model.addVar(
-          0.0, capacity, 0.0, GRB_CONTINUOUS,
-          "path_target_energy_" + suffix);
-      model.addConstr(origin_energy <= capacity * selected,
-                      "path_origin_active_" + suffix);
-      model.addConstr(target_energy <= capacity * selected,
-                      "path_target_active_" + suffix);
+      Var selected = model.AddVar(0.0, 1.0, 0.0, COPT_BINARY, ("path_selected_" + suffix).c_str());
+      Var origin_energy = model.AddVar(0.0, capacity, 0.0, COPT_CONTINUOUS, ("path_origin_energy_" + suffix).c_str());
+      Var target_energy = model.AddVar(0.0, capacity, 0.0, COPT_CONTINUOUS, ("path_target_energy_" + suffix).c_str());
+      model.AddConstr(origin_energy <= capacity * selected, ("path_origin_active_" + suffix).c_str());
+      model.AddConstr(target_energy <= capacity * selected, ("path_target_active_" + suffix).c_str());
       objective += spec.travel_time_h * selected;
       selection += selected;
       origin_flow += origin_energy;
@@ -1275,7 +1417,7 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
                               .target_energy = target_energy,
                               .stations = {}};
       variables.stations.reserve(spec.stations.size());
-      GRBLinExpr previous_departure = origin_energy;
+      Expr previous_departure = origin_energy;
       for (std::size_t station_index = 0;
            station_index < spec.stations.size(); ++station_index) {
         const int station_id = spec.stations[station_index];
@@ -1283,43 +1425,28 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
             suffix + "_" + std::to_string(station_index);
         const ChargingCurve& curve = instance_.curve_for_station(station_id);
         const double curve_upper = curve.time_at_energy(capacity);
-        GRBVar arrival = model.addVar(
-            0.0, capacity, 0.0, GRB_CONTINUOUS,
-            "path_station_arrival_" + station_suffix);
-        GRBVar departure = model.addVar(
-            0.0, capacity, 0.0, GRB_CONTINUOUS,
-            "path_station_departure_" + station_suffix);
-        GRBVar curve_arrival = model.addVar(
-            0.0, curve_upper, 0.0, GRB_CONTINUOUS,
-            "path_curve_arrival_" + station_suffix);
-        GRBVar curve_departure = model.addVar(
-            0.0, curve_upper, 0.0, GRB_CONTINUOUS,
-            "path_curve_departure_" + station_suffix);
-        GRBVar charge_duration = model.addVar(
-            0.0, curve_upper, 0.0, GRB_CONTINUOUS,
-            "path_charge_duration_" + station_suffix);
-        model.addConstr(arrival <= capacity * selected,
-                        "path_station_arrival_active_" + station_suffix);
-        model.addConstr(departure <= capacity * selected,
-                        "path_station_departure_active_" + station_suffix);
-        model.addConstr(departure >= arrival,
-                        "path_station_charge_" + station_suffix);
-        model.addConstr(arrival == previous_departure -
+        Var arrival = model.AddVar(0.0, capacity, 0.0, COPT_CONTINUOUS, ("path_station_arrival_" + station_suffix).c_str());
+        Var departure = model.AddVar(0.0, capacity, 0.0, COPT_CONTINUOUS, ("path_station_departure_" + station_suffix).c_str());
+        Var curve_arrival = model.AddVar(0.0, curve_upper, 0.0, COPT_CONTINUOUS, ("path_curve_arrival_" + station_suffix).c_str());
+        Var curve_departure = model.AddVar(0.0, curve_upper, 0.0, COPT_CONTINUOUS, ("path_curve_departure_" + station_suffix).c_str());
+        Var charge_duration = model.AddVar(0.0, curve_upper, 0.0, COPT_CONTINUOUS, ("path_charge_duration_" + station_suffix).c_str());
+        model.AddConstr(arrival <= capacity * selected, ("path_station_arrival_active_" + station_suffix).c_str());
+        model.AddConstr(departure <= capacity * selected, ("path_station_departure_active_" + station_suffix).c_str());
+        model.AddConstr(departure >= arrival, ("path_station_charge_" + station_suffix).c_str());
+        model.AddConstr(arrival == previous_departure -
                                        spec.leg_energy_wh[station_index] *
-                                           selected,
-                        "path_station_energy_" + station_suffix);
+                                           selected, ("path_station_energy_" + station_suffix).c_str());
         const CurvePoints& points =
             curve_points.at(instance_.node(station_id).station_type);
-        model.addGenConstrPWL(
-            arrival, curve_arrival, static_cast<int>(points.energy.size()),
+        PiecewiseCurve arrival_pwl = add_piecewise_curve(model,
+            arrival, curve_arrival, selected, static_cast<int>(points.energy.size()),
             points.energy.data(), points.time.data(),
             "path_arrival_curve_" + station_suffix);
-        model.addGenConstrPWL(
-            departure, curve_departure,
+        PiecewiseCurve departure_pwl = add_piecewise_curve(model,
+            departure, curve_departure, selected,
             static_cast<int>(points.energy.size()), points.energy.data(),
             points.time.data(), "path_departure_curve_" + station_suffix);
-        model.addConstr(charge_duration == curve_departure - curve_arrival,
-                        "path_charge_time_" + station_suffix);
+        model.AddConstr(charge_duration == curve_departure - curve_arrival, ("path_charge_time_" + station_suffix).c_str());
         objective += charge_duration;
         variables.stations.push_back(PathStationVariables{
             .station_id = station_id,
@@ -1327,27 +1454,23 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
             .departure = departure,
             .curve_arrival = curve_arrival,
             .curve_departure = curve_departure,
-            .charge_duration = charge_duration});
+            .charge_duration = charge_duration,
+            .arrival_curve = std::move(arrival_pwl),
+            .departure_curve = std::move(departure_pwl)});
         previous_departure = departure;
       }
-      model.addConstr(
-          target_energy ==
-              previous_departure - spec.leg_energy_wh.back() * selected,
-          "path_target_energy_balance_" + suffix);
+      model.AddConstr(target_energy ==
+              previous_departure - spec.leg_energy_wh.back() * selected, ("path_target_energy_balance_" + suffix).c_str());
       gap.paths.push_back(std::move(variables));
     }
-    model.addConstr(selection == 1.0,
-                    "select_path_" + std::to_string(gap_index));
-    model.addConstr(origin_flow == anchor_energy[gap_index],
-                    "path_origin_flow_" + std::to_string(gap_index));
-    model.addConstr(target_flow == anchor_energy[gap_index + 1],
-                    "path_target_flow_" + std::to_string(gap_index));
+    model.AddConstr(selection == 1.0, ("select_path_" + std::to_string(gap_index)).c_str());
+    model.AddConstr(origin_flow == anchor_energy[gap_index], ("path_origin_flow_" + std::to_string(gap_index)).c_str());
+    model.AddConstr(target_flow == anchor_energy[gap_index + 1], ("path_target_flow_" + std::to_string(gap_index)).c_str());
     gaps.push_back(std::move(gap));
   }
-  model.addConstr(objective + service_time_h <=
-                      instance_.vehicle().max_route_duration_h,
-                  "route_duration");
-  model.setObjective(objective, GRB_MINIMIZE);
+  model.AddConstr(objective + service_time_h <=
+                      instance_.vehicle().max_route_duration_h, "route_duration");
+  model.SetObjective(objective, COPT_MINIMIZE);
 
   bool mip_start_supplied = false;
   std::optional<double> mip_start_objective_h;
@@ -1403,33 +1526,29 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
 
     if (representable) {
       for (std::size_t index = 0; index < anchor_energy.size(); ++index) {
-        anchor_energy[index].set(
-            GRB_DoubleAttr_Start,
-            std::clamp(evaluation.departure_energy_wh[anchor_positions[index]],
+        model.SetMipStart(anchor_energy[index], std::clamp(evaluation.departure_energy_wh[anchor_positions[index]],
                        0.0, capacity));
       }
       for (std::size_t gap_index = 0; gap_index < gaps.size(); ++gap_index) {
         for (PathVariables& path : gaps[gap_index].paths) {
-          path.selected.set(GRB_DoubleAttr_Start, 0.0);
-          path.origin_energy.set(GRB_DoubleAttr_Start, 0.0);
-          path.target_energy.set(GRB_DoubleAttr_Start, 0.0);
+          model.SetMipStart(path.selected, 0.0);
+          model.SetMipStart(path.origin_energy, 0.0);
+          model.SetMipStart(path.target_energy, 0.0);
           for (PathStationVariables& station : path.stations) {
-            station.arrival.set(GRB_DoubleAttr_Start, 0.0);
-            station.departure.set(GRB_DoubleAttr_Start, 0.0);
-            station.curve_arrival.set(GRB_DoubleAttr_Start, 0.0);
-            station.curve_departure.set(GRB_DoubleAttr_Start, 0.0);
-            station.charge_duration.set(GRB_DoubleAttr_Start, 0.0);
+            model.SetMipStart(station.arrival, 0.0);
+            model.SetMipStart(station.departure, 0.0);
+            model.SetMipStart(station.curve_arrival, 0.0);
+            model.SetMipStart(station.curve_departure, 0.0);
+            model.SetMipStart(station.charge_duration, 0.0);
+            station.arrival_curve.set_start(model, 0.0, false);
+            station.departure_curve.set_start(model, 0.0, false);
           }
         }
         PathVariables& selected =
             gaps[gap_index].paths[selected_path_indices[gap_index]];
-        selected.selected.set(GRB_DoubleAttr_Start, 1.0);
-        selected.origin_energy.set(
-            GRB_DoubleAttr_Start,
-            evaluation.departure_energy_wh[anchor_positions[gap_index]]);
-        selected.target_energy.set(
-            GRB_DoubleAttr_Start,
-            evaluation.departure_energy_wh[anchor_positions[gap_index + 1]]);
+        model.SetMipStart(selected.selected, 1.0);
+        model.SetMipStart(selected.origin_energy, evaluation.departure_energy_wh[anchor_positions[gap_index]]);
+        model.SetMipStart(selected.target_energy, evaluation.departure_energy_wh[anchor_positions[gap_index + 1]]);
         for (std::size_t station_index = 0;
              station_index < selected.stations.size(); ++station_index) {
           PathStationVariables& station = selected.stations[station_index];
@@ -1439,15 +1558,13 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
           const double departure = evaluation.departure_energy_wh[position];
           const ChargingCurve& curve =
               instance_.curve_for_station(station.station_id);
-          station.arrival.set(GRB_DoubleAttr_Start, arrival);
-          station.departure.set(GRB_DoubleAttr_Start, departure);
-          station.curve_arrival.set(GRB_DoubleAttr_Start,
-                                    curve.time_at_energy(arrival));
-          station.curve_departure.set(GRB_DoubleAttr_Start,
-                                      curve.time_at_energy(departure));
-          station.charge_duration.set(
-              GRB_DoubleAttr_Start,
-              curve.charge_duration(arrival, departure));
+          model.SetMipStart(station.arrival, arrival);
+          model.SetMipStart(station.departure, departure);
+          station.arrival_curve.set_start(model, arrival);
+          station.departure_curve.set_start(model, departure);
+          model.SetMipStart(station.curve_arrival, curve.time_at_energy(arrival));
+          model.SetMipStart(station.curve_departure, curve.time_at_energy(departure));
+          model.SetMipStart(station.charge_duration, curve.charge_duration(arrival, departure));
         }
       }
       mip_start_supplied = true;
@@ -1455,11 +1572,23 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
     }
   }
 
-  const GurobiModelSize size = model_size(model);
+  const CoptModelSize size = model_size(model);
   const double model_build_runtime_s = wall_seconds(model_build_started);
-  const ModelTimeBudget budget = model_time_budget(config_, operation_deadline);
+  const auto emit = [&](FrvcpProgressEvent event) {
+    if (!progress) return;
+    progress(FrvcpProgress{
+        .event = event,
+        .wall_runtime_s = wall_seconds(call_started),
+        .path_generation_runtime_s = path_generation_runtime_s,
+        .model_build_runtime_s = model_build_runtime_s,
+        .mip_start_supplied = mip_start_supplied,
+        .model_size = size,
+        .network_size = catalog.size});
+  };
+  emit(FrvcpProgressEvent::ModelBuilt);
+  ModelTimeBudget budget = model_time_budget(config_, operation_deadline);
   if (budget.expired) {
-    FrvcpResult result = terminal_result(GRB_TIME_LIMIT);
+    FrvcpResult result = terminal_result(COPT_STATUS_TIMEOUT);
     result.model_build_runtime_s = model_build_runtime_s;
     result.model_size = size;
     result.mip_start_supplied = mip_start_supplied;
@@ -1467,18 +1596,34 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
     return result;
   }
   apply_time_budget(model, budget);
-  model.optimize();
-  const int status = model.get(GRB_IntAttr_Status);
-  const int solution_count = model.get(GRB_IntAttr_SolCount);
-  const double runtime = model.get(GRB_DoubleAttr_Runtime);
-  if (solution_count == 0) {
+  if (mip_start_supplied) {
+    model.LoadMipStart();
+    emit(FrvcpProgressEvent::MipStartLoaded);
+  }
+  emit(FrvcpProgressEvent::SolveStarted);
+  // Loading the start and observation callbacks also consume the wall budget.
+  budget = model_time_budget(config_, operation_deadline);
+  if (budget.expired) {
+    FrvcpResult result = terminal_result(COPT_STATUS_TIMEOUT);
+    result.model_build_runtime_s = model_build_runtime_s;
+    result.model_size = size;
+    result.mip_start_supplied = mip_start_supplied;
+    result.mip_start_objective_h = mip_start_objective_h;
+    return result;
+  }
+  apply_time_budget(model, budget);
+  model.Solve();
+  const int status = model.GetIntAttr(COPT_INTATTR_STATUS);
+  const int solution_count = model.GetIntAttr(COPT_INTATTR_HASSOL);
+  const double runtime = model.GetDblAttr(COPT_DBLATTR_SOLVINGTIME);
+  const auto unusable_solution = [&](int result_status) {
     const bool retain_incumbent =
         incumbent_plan != nullptr &&
-        (status == GRB_TIME_LIMIT || status == GRB_INTERRUPTED ||
-         status == GRB_SUBOPTIMAL);
+        (result_status == COPT_STATUS_TIMEOUT || result_status == COPT_STATUS_INTERRUPTED ||
+         result_status == COPT_STATUS_IMPRECISE || result_status == COPT_STATUS_NUMERICAL);
     return FrvcpResult{
-        .status = status,
-        .status_name = gurobi_status_name(status),
+        .status = result_status,
+        .status_name = copt_status_name(result_status),
         .plan = retain_incumbent ? std::optional<Plan>(*incumbent_plan)
                                  : std::nullopt,
         .model_objective_h =
@@ -1499,16 +1644,21 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
         .lower_bound_proved_infeasible = false,
         .model_size = size,
         .network_size = catalog.size};
+  };
+  if (solution_count == 0) return unusable_solution(status);
+  const double model_objective = model.GetDblAttr(COPT_DBLATTR_OBJVAL);
+  if (!finite_copt_value(model_objective)) {
+    return unusable_solution(COPT_STATUS_NUMERICAL);
   }
 
   std::vector<std::vector<int>> station_paths;
   std::vector<std::vector<double>> station_departures;
   station_paths.reserve(gaps.size());
   station_departures.reserve(gaps.size());
-  for (const GapVariables& gap : gaps) {
-    const PathVariables* selected = nullptr;
-    for (const PathVariables& candidate : gap.paths) {
-      if (candidate.selected.get(GRB_DoubleAttr_X) > 0.5) {
+  for (GapVariables& gap : gaps) {
+    PathVariables* selected = nullptr;
+    for (PathVariables& candidate : gap.paths) {
+      if (candidate.selected.Get(COPT_DBLINFO_VALUE) > 0.5) {
         if (selected != nullptr) {
           throw std::runtime_error("FRVCP selected multiple paths in one gap");
         }
@@ -1521,8 +1671,8 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
     station_paths.push_back(selected->spec->stations);
     std::vector<double> departures;
     departures.reserve(selected->stations.size());
-    for (const PathStationVariables& station : selected->stations) {
-      departures.push_back(station.departure.get(GRB_DoubleAttr_X));
+    for (PathStationVariables& station : selected->stations) {
+      departures.push_back(station.departure.Get(COPT_DBLINFO_VALUE));
     }
     station_departures.push_back(std::move(departures));
   }
@@ -1538,20 +1688,30 @@ FrvcpResult GurobiFrvcp::solve(const std::vector<int>& customer_ids,
     }
     if (gap_index < customer_ids.size()) ++visit_index;
   }
-  auto evaluation = evaluator_.evaluate_schedule(route, schedule);
-  const double model_objective = model.get(GRB_DoubleAttr_ObjVal);
-  if (std::abs(evaluation->raw_cost_h - model_objective) > 1e-5) {
-    throw std::runtime_error("FRVCP path model and replay objectives disagree");
+  std::shared_ptr<const RouteEvaluation> evaluation;
+  try {
+    evaluation = evaluator_.evaluate_schedule(route, schedule);
+  } catch (const std::invalid_argument&) {
+    // Backend feasibility tolerances can admit a physically invalid schedule.
+    return unusable_solution(COPT_STATUS_NUMERICAL);
   }
+  if (!detail::valid_frvcp_replay(*evaluation, model_objective)) {
+    return unusable_solution(COPT_STATUS_NUMERICAL);
+  }
+  // OPTIMAL certifies this pruned model only. A feasible objective meeting an
+  // independent lower bound additionally certifies the full customer order.
+  const bool fixed_order_certificate = status == COPT_STATUS_OPTIMAL &&
+      std::isfinite(objective_lower_bound_h) &&
+      evaluation->raw_cost_h <= objective_lower_bound_h + kCostTolerance;
   Plan plan{.customer_ids = customer_ids,
             .gaps = std::move(station_paths),
             .route = std::move(route),
             .evaluation = std::move(evaluation),
-            .exact_charging = status == GRB_OPTIMAL};
-  if (status == GRB_OPTIMAL) factory_.publish_exact(plan);
+            .exact_charging = fixed_order_certificate};
+  if (fixed_order_certificate) factory_.publish_exact(plan);
   return FrvcpResult{
       .status = status,
-      .status_name = gurobi_status_name(status),
+      .status_name = copt_status_name(status),
       .plan = std::move(plan),
       .model_objective_h = model_objective,
       .runtime_s = runtime,

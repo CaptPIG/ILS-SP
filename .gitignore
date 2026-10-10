@@ -6,3 +6,45 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Build products and local configuration
+/CMakeUserPresets.json
+/cmake-build-*/
+/compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Private credentials and separately installed solver SDKs
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.lic
+license.dat
+license.key
+/copt*/
+/vendor/
+/licenses/
+/credentials/
+
+# This repository publishes core source only
+/tests/
+/data/
+/experiments/
+/validation/
+/runs/
+/checkpoints/
+/backups/
+/cache/
+*.trace
+*.work
+*.profraw
+*.profdata

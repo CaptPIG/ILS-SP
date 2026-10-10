@@ -17,14 +17,14 @@ using SolverClock = std::chrono::steady_clock;
 }
 
 [[nodiscard]] std::optional<double> remaining_seconds(
-    GurobiDeadline deadline) {
+    CoptDeadline deadline) {
   if (!deadline.has_value()) return std::nullopt;
   return std::max(
       0.0,
       std::chrono::duration<double>(*deadline - SolverClock::now()).count());
 }
 
-[[nodiscard]] bool deadline_expired(GurobiDeadline deadline) {
+[[nodiscard]] bool deadline_expired(CoptDeadline deadline) {
   return deadline.has_value() && SolverClock::now() >= *deadline;
 }
 
@@ -97,29 +97,63 @@ struct SpMipStartChoice {
 
 }  // namespace
 
-IlsSpSolver::IlsSpSolver(const Instance& instance, GRBEnv& environment,
+IlsSpSolver::IlsSpSolver(const Instance& instance, Envr& environment,
                          SolverConfig config)
     : instance_(instance),
       config_(std::move(config)),
       random_(config_.seed),
       evaluator_(instance_, config_.evaluation_cache_capacity),
-      factory_(instance_, evaluator_, config_.exact_cache_capacity),
-      path_sampler_(instance_, factory_, random_),
+      factory_(instance_, evaluator_, config_.exact_cache_capacity,
+               config_.preserve_station_visits ||
+                   config_.project_opening_station_visits),
+      path_sampler_(instance_, factory_, random_, config_.complete_path_catalog,
+                    config_.implicit_replace_path),
       initial_builder_(instance_, factory_, path_sampler_, random_,
-                       config_.search_profile, config_.promising_arc_count,
-                       config_.granular_threshold),
+                       config_.complete_initialization_paths.value_or(
+                           config_.complete_insertion_paths.value_or(false))
+                           ? SearchProfile::LinkedInsertionCandidates : config_.search_profile,
+                       config_.promising_arc_count,
+                       config_.granular_threshold,
+                       config_.rebuild_initialization_paths,
+                       config_.preserve_initialization_station_visits),
       perturbation_(instance_, factory_, path_sampler_, random_,
-                    config_.search_profile, config_.promising_arc_count,
-                    config_.granular_threshold),
+                    config_.complete_insertion_paths.value_or(false)
+                        ? SearchProfile::LinkedInsertionCandidates : config_.search_profile,
+                    config_.promising_arc_count,
+                    config_.granular_threshold, config_.partial_route_subset,
+                    config_.preserve_station_visits),
       vnd_(instance_, factory_, path_sampler_, random_,
-           config_.promising_arc_count, config_.search_profile),
-      pool_(config_.paper.pool_capacity),
+           config_.promising_arc_count, config_.search_profile,
+           config_.replace_path_attempts, config_.project_opening_station_visits,
+           config_.preserve_swap_station_visits),
+      pool_(config_.paper.pool_capacity, kCostTolerance,
+            config_.pool_identity, config_.keep_evicted_in_backup),
       set_partitioning_(instance_, environment, config_.set_partitioning),
       frvcp_(instance_, evaluator_, factory_, environment, config_.frvcp,
              config_.infeasible_cache_capacity),
       penalty_lambda_(config_.paper.lambda_initial) {
   const PaperParameters& paper = config_.paper;
-  if (paper.penalty_window == 0 || paper.penalty_factor <= 1.0 ||
+  if ((config_.rebuild_initialization_paths || config_.preserve_initialization_station_visits) &&
+      (config_.search_profile != SearchProfile::Paper ||
+       !config_.complete_initialization_paths.value_or(false))) {
+    throw std::invalid_argument("station initialization requires completed paper initialization");
+  }
+  if (config_.complete_initialization_paths.has_value() &&
+      config_.search_profile != SearchProfile::Paper) {
+    throw std::invalid_argument("--initialization-paths requires the paper profile");
+  }
+  if ((config_.complete_insertion_paths.has_value() ||
+       config_.preserve_station_visits) &&
+      config_.search_profile != SearchProfile::Paper) {
+    throw std::invalid_argument("--insertion-paths requires the paper profile");
+  }
+  if (config_.preserve_station_visits &&
+      config_.complete_insertion_paths.value_or(false)) {
+    throw std::invalid_argument("preserve-cs cannot use completed insertion");
+  }
+  if (paper.penalty_window == 0 || !std::isfinite(paper.penalty_factor) ||
+      !std::isfinite(paper.lambda_min) || !std::isfinite(paper.lambda_initial) ||
+      !std::isfinite(paper.lambda_max) || paper.penalty_factor <= 1.0 ||
       paper.lambda_min < 0.0 || paper.lambda_min > paper.lambda_initial ||
       paper.lambda_initial > paper.lambda_max || paper.sp_frequency == 0 ||
       paper.backup_frequency == 0 || paper.pool_capacity == 0 ||
@@ -192,8 +226,8 @@ bool IlsSpSolver::rounded_target_reached(const Solution& candidate) const {
 }
 
 std::optional<Solution> IlsSpSolver::assemble_routes(
-    const Solution& local, const std::optional<Solution>& best,
-    std::size_t iteration, GurobiDeadline deadline,
+    Solution& local, const std::optional<Solution>& best,
+    std::size_t iteration, CoptDeadline deadline,
     const std::function<void(const ExactStageProgress&)>& exact_progress) {
   for (const Plan& plan : local.plans) {
     if (plan.evaluation->feasible) {
@@ -234,10 +268,21 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
       last_coverage_improvement_iteration_ = iteration;
     }
   }
-  if (!run_sp) return std::nullopt;
+  if (!run_sp) {
+    // TRC Algorithm 5 leaves S'' undefined on ordinary rounds. Pass through
+    // the generator output without an extra optimizer; HLNS Algorithm 1
+    // lines 6-9 identifies the VND output as the ordinary-round candidate.
+    // Algorithm 1's TRC acceptance condition still governs current and best.
+    if (config_.continuation_policy == ContinuationPolicy::Record) {
+      return std::move(local);
+    }
+    return std::nullopt;
+  }
   if (deadline_expired(deadline)) return std::nullopt;
   const std::vector<RouteColumn> columns = pool_.main_columns();
-  if (deadline_expired(deadline) || !pool_covers_all_customers(columns)) {
+  if (deadline_expired(deadline)) return std::nullopt;
+  if (!pool_covers_all_customers(columns)) {
+    ++sp_skipped_incomplete_pool_;
     return std::nullopt;
   }
 
@@ -418,11 +463,13 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
     checkpoint.model_size = relaxation.model_size;
     exact_progress(checkpoint);
   }
-  if (relaxation.status == GRB_OPTIMAL) {
+  if (relaxation.status == COPT_STATUS_OPTIMAL) {
     pool_.update_duals(std::move(relaxation.duals));
-    const PoolRepriceUpdate repriced = pool_.reprice_backup();
-    if (repriced.effective_coverage_improvements != 0) {
-      last_coverage_improvement_iteration_ = iteration;
+    if (config_.reprice_after_lp) {
+      const PoolRepriceUpdate repriced = pool_.reprice_backup();
+      if (repriced.effective_coverage_improvements != 0) {
+        last_coverage_improvement_iteration_ = iteration;
+      }
     }
   }
   if (!assembled.has_value() || deadline_expired(deadline)) return assembled;
@@ -446,10 +493,39 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
       checkpoint.mip_start_objective_h =
           selected.plan.evaluation->raw_cost_h;
       checkpoint.mip_start_source = "sp_selected";
+      checkpoint.route_visits = selected.plan.route.visits;
       exact_progress(checkpoint);
     }
     ++frvcp_calls_;
-    FrvcpResult optimized = frvcp_.optimize(selected.plan, deadline);
+    FrvcpProgressCallback frvcp_progress;
+    if (exact_progress) {
+      frvcp_progress = [&](const FrvcpProgress& event) {
+        ExactStageProgress checkpoint;
+        checkpoint.stage = ExactStage::Frvcp;
+        checkpoint.boundary = event.event == FrvcpProgressEvent::ModelBuilt
+            ? ExactStageBoundary::ModelBuilt : ExactStageBoundary::Progress;
+        checkpoint.backend_phase = event.event == FrvcpProgressEvent::ModelBuilt
+            ? "model_built" : event.event == FrvcpProgressEvent::MipStartLoaded
+            ? "mip_start_loaded" : "solve_started";
+        checkpoint.iteration = iteration;
+        checkpoint.pool_columns = columns.size();
+        checkpoint.selected_routes = partition.selected_columns.size();
+        checkpoint.route_index = index + 1;
+        checkpoint.route_customer_count = selected.plan.customer_ids.size();
+        checkpoint.route_gap_count = selected.plan.customer_ids.size() + 1;
+        checkpoint.remaining_time_s = remaining_seconds(deadline);
+        checkpoint.assembled_objective_h = assembled->raw_cost_h();
+        checkpoint.wall_runtime_s = event.wall_runtime_s;
+        checkpoint.path_generation_runtime_s = event.path_generation_runtime_s;
+        checkpoint.model_build_runtime_s = event.model_build_runtime_s;
+        checkpoint.mip_start_supplied = event.mip_start_supplied;
+        checkpoint.model_size = event.model_size;
+        checkpoint.network_size = event.network_size;
+        exact_progress(checkpoint);
+      };
+    }
+    FrvcpResult optimized = frvcp_.optimize(selected.plan, deadline,
+                                          std::move(frvcp_progress));
     frvcp_model_runtime_s_ += optimized.runtime_s;
     if (optimized.plan.has_value() &&
         optimized.plan->evaluation->feasible) {
@@ -501,6 +577,8 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
       checkpoint.mip_start_source = "sp_selected";
       checkpoint.mip_start_supplied = optimized.mip_start_supplied;
       checkpoint.analytic_optimum = optimized.analytic_optimum;
+      checkpoint.fixed_order_optimal = optimized.plan.has_value() &&
+          optimized.plan->exact_charging;
       checkpoint.lower_bound_proved_infeasible =
           optimized.lower_bound_proved_infeasible;
       checkpoint.objective_lower_bound_h =
@@ -517,7 +595,8 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
 
 SolverResult IlsSpSolver::solve(
     std::function<void(const SolverProgress&)> progress,
-    std::function<void(const ExactStageProgress&)> exact_progress) {
+    std::function<void(const ExactStageProgress&)> exact_progress,
+    std::function<void(const RecordImprovementProgress&)> record_progress) {
   const auto started = SolverClock::now();
   const auto deadline = config_.global_time_limit_s.has_value()
                             ? std::optional<SolverClock::time_point>(
@@ -527,6 +606,8 @@ SolverResult IlsSpSolver::solve(
                                                     *config_.global_time_limit_s)))
                             : std::nullopt;
   Solution current = initial_builder_.build(penalty_lambda_);
+  const bool continue_from_record =
+      config_.continuation_policy == ContinuationPolicy::Record;
   const auto initialization_finished = SolverClock::now();
   const double initialization_runtime_s =
       elapsed_seconds(started, initialization_finished);
@@ -585,6 +666,7 @@ SolverResult IlsSpSolver::solve(
             path_sampler_.option_candidates_generated(),
         .path_option_nondominated_generated =
             path_sampler_.option_nondominated_generated(),
+        .replacement_summary_statistics = path_sampler_.replacement_summary_statistics(),
         .virtual_completion_cache_size =
             path_sampler_.virtual_completion_cache_size(),
         .virtual_completion_cache_hits =
@@ -639,6 +721,27 @@ SolverResult IlsSpSolver::solve(
   double interval_lp_model_start_s = lp_model_runtime_s_;
   double interval_frvcp_model_start_s = frvcp_model_runtime_s_;
 
+  const auto record_candidate = [&](const Solution& candidate,
+                                    std::size_t iteration) {
+    if (!update_best(candidate, best)) return false;
+    // One steady-clock read per actual record only when an observer exists.
+    // All record call sites, including the operational comparison, pass here.
+    if (record_progress) {
+      const auto recorded_at = SolverClock::now();
+      record_progress(RecordImprovementProgress{
+          .iteration = iteration,
+          .objective_h = best->raw_cost_h(),
+          .elapsed_s = elapsed_seconds(started, recorded_at)});
+    }
+    last_best_improvement_iteration_ = iteration;
+    const std::uint64_t generation_before = pool_.effective_generation();
+    if (config_.protect_best_partition) pool_.protect_partition(*best);
+    if (pool_.effective_generation() != generation_before) {
+      last_coverage_improvement_iteration_ = iteration;
+    }
+    return true;
+  };
+
   for (std::size_t iteration = 1; iteration <= config_.paper.max_iterations;
        ++iteration) {
     if (deadline.has_value() && SolverClock::now() >= *deadline) {
@@ -647,6 +750,11 @@ SolverResult IlsSpSolver::solve(
     }
     const auto perturbation_started = SolverClock::now();
     Solution perturbed = perturbation_.apply(current, penalty_lambda_);
+    // Algorithm 2 line 2 assigns S before line 3 produces the separate S'.
+    // The shared-input interpretation preserves this generator assignment as
+    // well as Algorithm 1's conditional assembler assignment. Keep a separate
+    // VND input: rejecting its output must retain the perturbed generator base.
+    if (continue_from_record) current = perturbed;
     const double perturbation_s =
         elapsed_seconds(perturbation_started, SolverClock::now());
     perturbation_runtime_s += perturbation_s;
@@ -659,14 +767,9 @@ SolverResult IlsSpSolver::solve(
     interval_vnd_s += vnd_s;
 
     observe_penalty(local.feasible());
-    if (update_best(local, best)) {
-      last_best_improvement_iteration_ = iteration;
-      const std::uint64_t generation_before = pool_.effective_generation();
-      pool_.protect_partition(*best);
-      if (pool_.effective_generation() != generation_before) {
-        last_coverage_improvement_iteration_ = iteration;
-      }
-    }
+    // The historical operational experiment also records local before SP.
+    // The paper policy records only the complete assembler return below.
+    if (!continue_from_record) record_candidate(local, iteration);
     const bool target_before_assembly =
         best.has_value() && rounded_target_reached(*best);
     const bool expired_before_assembly =
@@ -680,27 +783,27 @@ SolverResult IlsSpSolver::solve(
       assembler_runtime_s += assembler_s;
       interval_assembler_s += assembler_s;
       if (assembled.has_value()) {
-        current = std::move(*assembled);
-        if (update_best(current, best)) {
-          last_best_improvement_iteration_ = iteration;
-          const std::uint64_t generation_before = pool_.effective_generation();
-          pool_.protect_partition(*best);
-          if (pool_.effective_generation() != generation_before) {
-            last_coverage_improvement_iteration_ = iteration;
+        if (continue_from_record) {
+          if (record_candidate(*assembled, iteration)) {
+            current = std::move(*assembled);
           }
+        } else {
+          current = std::move(*assembled);
+          record_candidate(current, iteration);
         }
-      } else {
-        // Algorithm 5 only assigns S'' on SP iterations.  On ordinary
-        // iterations S' must pass through so that the next perturbation starts
-        // from the local solution, as made explicit by Algorithm 1 line 16 of
-        // the predecessor HLNS method.
+      } else if (!continue_from_record) {
+        // Historical operational continuation is an explicit experiment;
+        // EJOR's unconditional update does not override TRC Algorithm 1.
         current = std::move(local);
       }
       iterations = iteration;
     } else {
-      current = std::move(local);
+      if (!continue_from_record) current = std::move(local);
       if (target_before_assembly) iterations = iteration;
     }
+    // Without a feasible improving return, the assembler leaves best and the
+    // generator's perturbed S unchanged. It never accepts VND output merely
+    // to continue the search. Penalties observe local, not this retained base.
 
     const bool deadline_reached =
         deadline.has_value() && SolverClock::now() >= *deadline;
@@ -774,6 +877,7 @@ SolverResult IlsSpSolver::solve(
               path_sampler_.option_candidates_generated(),
           .path_option_nondominated_generated =
               path_sampler_.option_nondominated_generated(),
+          .replacement_summary_statistics = path_sampler_.replacement_summary_statistics(),
           .virtual_completion_cache_size =
               path_sampler_.virtual_completion_cache_size(),
           .virtual_completion_cache_hits =
@@ -840,9 +944,24 @@ SolverResult IlsSpSolver::solve(
       break;
     }
   }
+  // Diagnose terminal coverage only after search has stopped. Do not create
+  // feasible columns or change the periodic SP guard to fill the missing rows.
+  std::unordered_set<int> covered_customers;
+  for (const RouteColumn& column : pool_.main_columns()) {
+    covered_customers.insert(column.customer_set.begin(),
+                             column.customer_set.end());
+  }
+  std::vector<int> uncovered_customers;
+  for (const int customer : instance_.customer_ids()) {
+    if (!covered_customers.contains(customer)) {
+      uncovered_customers.push_back(customer);
+    }
+  }
   const double runtime = elapsed_seconds(started, SolverClock::now());
   return SolverResult{
       .best_solution = std::move(best),
+      .final_solution = std::move(current),
+      .pool_uncovered_customers = std::move(uncovered_customers),
       .iterations = iterations,
       .runtime_s = runtime,
       .final_penalty_lambda = penalty_lambda_,
@@ -853,6 +972,7 @@ SolverResult IlsSpSolver::solve(
       .pool_effective_generation = pool_.effective_generation(),
       .pool_statistics = pool_.statistics(),
       .sp_calls = sp_calls_,
+      .sp_skipped_incomplete_pool = sp_skipped_incomplete_pool_,
       .adaptive_sp_calls = adaptive_sp_calls_,
       .lp_calls = lp_calls_,
       .frvcp_calls = frvcp_calls_,
@@ -893,6 +1013,7 @@ SolverResult IlsSpSolver::solve(
       .initial_insertion_statistics = initial_builder_.statistics(),
       .repair_insertion_statistics = perturbation_.statistics(),
       .vnd_statistics = vnd_.statistics(),
+      .replacement_summary_statistics = path_sampler_.replacement_summary_statistics(),
       .stop_reason = std::move(stop_reason)};
 }
 
