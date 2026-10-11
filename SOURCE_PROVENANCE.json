@@ -1,0 +1,106 @@
+{
+  "source_version": "439f_plus_exact_packed_DFS_mask",
+  "source_archive_sha256": "af49f1efffbebdf444e360253a2ee37911cbfe6cd34218a03ee56f2727243830",
+  "historical_binary_sha256_reference_only": "5f0dd54d7cd7c1496e1c9ba273a5a5c5f8f61e31ac3688ee173dc337068273d4",
+  "required_compile_definitions": [
+    "ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD=1",
+    "ILS_SP_FORWARD_ONLY_TWO_OPT=1",
+    "ILS_SP_TYPED_DELETE_ENTRY=1",
+    "ILS_SP_PACKED_DFS_MASK=1"
+  ],
+  "source_files": {
+    "include/ils_sp/copt_models.hpp": {
+      "archive_path": "cpp/include/ils_sp/copt_models.hpp",
+      "sha256": "13c02d2791987f93b4b97a04cc5c68717555bb27d9f459d5b04d9b349b3ed042"
+    },
+    "include/ils_sp/core.hpp": {
+      "archive_path": "cpp/include/ils_sp/core.hpp",
+      "sha256": "b99baf5bc1724a529da0a4a73f12426b941e6424a449c2a883e9024435f68be3"
+    },
+    "include/ils_sp/detail/copt_result_validation.hpp": {
+      "archive_path": "cpp/include/ils_sp/detail/copt_result_validation.hpp",
+      "sha256": "b687f02b2de57a86eaac72572fb671e6ede5068fcd44a1889d799df7697b4ce5"
+    },
+    "include/ils_sp/detail/frvcp_active_budget.hpp": {
+      "archive_path": "cpp/include/ils_sp/detail/frvcp_active_budget.hpp",
+      "sha256": "239785a6a401fe81f446a86624bf49e05fa92de0e1fe3f44fec298a908108fad"
+    },
+    "include/ils_sp/detail/xxhash_api.hpp": {
+      "archive_path": "cpp/include/ils_sp/detail/xxhash_api.hpp",
+      "sha256": "affb0a548c30fc7f5b5308816aa3b4aa04753f212d6031c9d57600c629d3c50f"
+    },
+    "include/ils_sp/evaluator.hpp": {
+      "archive_path": "cpp/include/ils_sp/evaluator.hpp",
+      "sha256": "b4e6301cf0cbaae942df1a9def4983a1aa339d23ec6e69044cdcbc4f0933fed2"
+    },
+    "include/ils_sp/lru_cache.hpp": {
+      "archive_path": "cpp/include/ils_sp/lru_cache.hpp",
+      "sha256": "bf5cd045b7440da4c2685e8ae19a83579e8f20c51d0ebb14488410af251ed474"
+    },
+    "include/ils_sp/pool.hpp": {
+      "archive_path": "cpp/include/ils_sp/pool.hpp",
+      "sha256": "05ff590df530d3cf57d3020b7d9ca81306ce19160c1132115c5cd073cd49b331"
+    },
+    "include/ils_sp/search.hpp": {
+      "archive_path": "cpp/include/ils_sp/search.hpp",
+      "sha256": "21ec10a862333a13a9796cbc49356d015a85ce0db8e7692f4eef0050ba0f2614"
+    },
+    "include/ils_sp/solver.hpp": {
+      "archive_path": "cpp/include/ils_sp/solver.hpp",
+      "sha256": "39d06ab782ff26e912d7307af390359f7edc2055f494edbebe8b6863d34c7f13"
+    },
+    "include/ils_sp/xml.hpp": {
+      "archive_path": "cpp/include/ils_sp/xml.hpp",
+      "sha256": "468ae5e5d4a3f63c650f8dbb8b8a44cbba2721eaf1686c9f3488fd60e230a8c8"
+    },
+    "src/catalog_disk_cache.inc": {
+      "archive_path": "cpp/src/catalog_disk_cache.inc",
+      "sha256": "542b395a399f1de85a21fc54d79f215cd650125350e88a63f3963dd5e3a31e88"
+    },
+    "src/copt_models.cpp": {
+      "archive_path": "cpp/src/copt_models.cpp",
+      "sha256": "f9fd9110b0f9f72787c871286c75648f7a9e437a8f734d8ed575571adee4b132"
+    },
+    "src/core.cpp": {
+      "archive_path": "cpp/src/core.cpp",
+      "sha256": "0949c612db0ed3a5b69caa194e61e8f25e4b95f0f846263f27f51f8c52708d03"
+    },
+    "src/evaluator.cpp": {
+      "archive_path": "cpp/src/evaluator.cpp",
+      "sha256": "e8a6425b013dbbd6763eaea02978d5ccf78bfbecaff87d56ed7f66b44c45bce0"
+    },
+    "src/main.cpp": {
+      "archive_path": "cpp/src/main.cpp",
+      "sha256": "ce5dccdf504e7521b4bb13fd5093b3a101fb95984374c2b7e07af7279e439e4b"
+    },
+    "src/pool.cpp": {
+      "archive_path": "cpp/src/pool.cpp",
+      "sha256": "ca38df0d8634b632bfca4c215aec0e1afe71d2c8f80d1f5799967664bcc4c142"
+    },
+    "src/search.cpp": {
+      "archive_path": "cpp/src/search.cpp",
+      "sha256": "3df57e8ddc7a645e09dfa1064b89d79b71b29f85b5410fb80a0d3ab9abadebc7"
+    },
+    "src/solver.cpp": {
+      "archive_path": "cpp/src/solver.cpp",
+      "sha256": "1bd73f5df79213a78c566b35e1c355e3496ad3b82fd449e3a5019b37c260f9cb"
+    },
+    "src/xml.cpp": {
+      "archive_path": "cpp/src/xml.cpp",
+      "sha256": "aa705fb98d74bcab8aadfe44837da0c8d3bc6b7052b73a0c5d12253de7c4be4f"
+    },
+    "src/main_with_schedule.cpp": {
+      "archive_path": "validation_source/main_with_schedule.cpp",
+      "sha256": "ce19a5550f3afea700631b1203f39d245ff82dda9a32d2037d892179f9e44a53"
+    },
+    "src/schedule_certificate.hpp": {
+      "archive_path": "validation_source/schedule_certificate.hpp",
+      "sha256": "512dcae37873ec43d5d83bba47b80a3b11a159c07f95aa037df97d4609b4b0e9"
+    }
+  },
+  "notes": [
+    "Core and frontend file bytes are unchanged from the frozen source archive; only repository paths were mapped.",
+    "Build metadata and README are adapted to the existing repository layout.",
+    "A locally rebuilt executable has a new identity; do not assign it the historical binary hash."
+  ]
+}

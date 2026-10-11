@@ -2,10 +2,13 @@
 
 #include <functional>
 
-#include "ils_sp/gurobi_models.hpp"
+#include "ils_sp/copt_models.hpp"
+#include "ils_sp/detail/frvcp_active_budget.hpp"
 #include "ils_sp/search.hpp"
 
 namespace ils_sp {
+
+enum class ContinuationPolicy { Operational, Record };
 
 struct PaperParameters {
   std::size_t penalty_window{50};
@@ -25,15 +28,54 @@ struct SolverConfig {
   std::size_t promising_arc_count{40};
   std::size_t granular_threshold{100};
   SearchProfile search_profile{SearchProfile::Paper};
+  // Record follows TRC Algorithm 1's assembler acceptance. Algorithm 2's S
+  // is shared with the caller; its generator assignment keeps the perturbed
+  // base if assembly is rejected (authorized Class A state-passing choice).
+  // The undefined non-SP return passes through the generator's VND output.
+  ContinuationPolicy continuation_policy{ContinuationPolicy::Record};
+  bool complete_path_catalog{true};
+  bool implicit_replace_path{false};
+  // Single proposal only; the four-proposal A experiment was rejected at G1.
+  std::size_t replace_path_attempts{1};
+  // A-class choice only for the final oversize RandomRoute/Target route.
+  PartialRouteSubset partial_route_subset{PartialRouteSubset::Prefix};
+  // Class A for Paper construction/repair only; VND retains direct-gap
+  // best-improvement ranking. Other profiles define their own assignments.
+  std::optional<bool> complete_insertion_paths;
+  // Optional A interpretation for initial construction only. Unset preserves
+  // the existing insertion/profile policy; it never changes LNS or VND.
+  std::optional<bool> complete_initialization_paths;
+  // Explicit initialization-only alternative: rebuild all station choices
+  // from the direct customer sequence for each insertion candidate.
+  bool rebuild_initialization_paths{false};
+  // Initialization-only physical insertion; complete only new singleton routes.
+  bool preserve_initialization_station_visits{false};
+  // Explicit LNS interpretation: customer removal/insertion preserves the
+  // physical station visits. No insertion-time path completion; VND keeps
+  // its separately specified customer-gap and promising-arc contracts.
+  bool preserve_station_visits{false};
+  // Explicit A interpretation for Relocate route opening: each child keeps
+  // the parent's station visits while retaining only its assigned customers.
+  bool project_opening_station_visits{false};
+  // Class A: Swap customer IDs in their original physical slots; CS stay put.
+  bool preserve_swap_station_visits{false};
   std::size_t evaluation_cache_capacity{200'000};
   std::size_t exact_cache_capacity{20'000};
+  // Legacy name: bounds the combined restricted-model optimal/infeasible memo.
   std::size_t infeasible_cache_capacity{20'000};
-  GurobiConfig set_partitioning;
-  GurobiConfig frvcp;
+  CoptConfig set_partitioning;
+  CoptConfig frvcp;
   std::optional<double> global_time_limit_s;
+  // Optional solve-wide active FRVCP wall allowance; SP/LP are unchanged.
+  std::optional<double> frvcp_active_wall_budget_s;
   std::optional<double> rounded_target_objective_h;
-  std::optional<double> sp_incumbent_stall_limit_s{30.0};
-  std::optional<double> sp_maximum_time_s{90.0};
+  std::optional<double> sp_incumbent_stall_limit_s;
+  std::optional<double> sp_maximum_time_s;
+  PoolIdentity pool_identity{PoolIdentity::OrderedSequence};
+  // Explicit non-paper pool extensions; disabled in reproduction runs.
+  bool protect_best_partition{false};
+  bool keep_evicted_in_backup{false};
+  bool reprice_after_lp{false};
   // Explicit non-paper extension. A full route pool may call SP before the
   // regular frequency after both record and coverage quality have stalled.
   std::optional<std::size_t> adaptive_sp_stall_iterations;
@@ -89,6 +131,7 @@ struct SolverProgress {
   std::size_t path_option_rebuilds{};
   std::uint64_t path_option_candidates_generated{};
   std::uint64_t path_option_nondominated_generated{};
+  ReplacementSummaryStatistics replacement_summary_statistics;
   std::size_t virtual_completion_cache_size{};
   std::size_t virtual_completion_cache_hits{};
   std::size_t virtual_completion_cache_misses{};
@@ -135,6 +178,8 @@ struct ExactStageProgress {
   std::size_t route_index{};  // One-based for FRVCP; zero otherwise.
   std::size_t route_customer_count{};
   std::size_t route_gap_count{};
+  std::vector<int> route_visits;  // FRVCP input, excluding depot endpoints.
+  std::string backend_phase;
   std::optional<double> remaining_time_s;
   std::optional<double> applied_time_limit_s;
   std::optional<double> objective_h;
@@ -150,7 +195,7 @@ struct ExactStageProgress {
   double wall_runtime_s{};
   double path_generation_runtime_s{};
   double model_build_runtime_s{};
-  double explored_nodes{};
+  std::optional<double> explored_nodes;
   int solution_count{};
   std::size_t mip_start_routes{};
   bool cache_hit{};
@@ -158,14 +203,30 @@ struct ExactStageProgress {
   bool incumbent_stall_limit_reached{};
   bool mip_start_supplied{};
   bool analytic_optimum{};
+  bool fixed_order_optimal{};
   bool lower_bound_proved_infeasible{};
   std::optional<double> objective_lower_bound_h;
-  GurobiModelSize model_size;
+  CoptModelSize model_size;
   FrvcpNetworkSize network_size;
+};
+
+// Emitted only after the existing feasible record-improvement gate succeeds.
+// Initialization is not a record: Algorithm 1 starts Sbest empty. Its first
+// event is the first accepted candidate, at an iteration >= 1. Elapsed time
+// starts at solve() entry, including initialization, excluding construction.
+struct RecordImprovementProgress {
+  std::size_t iteration{};
+  double objective_h{};
+  double elapsed_s{};
 };
 
 struct SolverResult {
   std::optional<Solution> best_solution;
+  // Output-only safety snapshot; never admitted to search or reported as a record.
+  std::optional<Solution> initialization_fallback;
+  // Terminal search state, which may be infeasible; never a quality record.
+  Solution final_solution;
+  std::vector<int> pool_uncovered_customers;
   std::size_t iterations{};
   double runtime_s{};
   double final_penalty_lambda{};
@@ -176,6 +237,7 @@ struct SolverResult {
   std::uint64_t pool_effective_generation{};
   PoolStatistics pool_statistics;
   std::size_t sp_calls{};
+  std::size_t sp_skipped_incomplete_pool{};
   std::size_t adaptive_sp_calls{};
   std::size_t lp_calls{};
   std::size_t frvcp_calls{};
@@ -210,22 +272,32 @@ struct SolverResult {
   InsertionCandidateStatistics initial_insertion_statistics;
   InsertionCandidateStatistics repair_insertion_statistics;
   VndStatistics vnd_statistics;
+  ReplacementSummaryStatistics replacement_summary_statistics;
+  std::size_t continuation_exploration_entries{};
+  std::size_t continuation_exploration_iterations{};
+  std::size_t continuation_record_exits{};
+  std::size_t continuation_epoch_exits{};
+  double frvcp_active_wall_spent_s{};
+  std::size_t frvcp_budget_skipped_routes{};
+  bool frvcp_budget_exhausted{};
   std::string stop_reason;
 };
 
 class IlsSpSolver {
  public:
-  IlsSpSolver(const Instance& instance, GRBEnv& environment,
+  IlsSpSolver(const Instance& instance, Envr& environment,
               SolverConfig config = {});
 
   [[nodiscard]] SolverResult solve(
       std::function<void(const SolverProgress&)> progress = {},
-      std::function<void(const ExactStageProgress&)> exact_progress = {});
+      std::function<void(const ExactStageProgress&)> exact_progress = {},
+      std::function<void(const RecordImprovementProgress&)> record_progress = {});
 
  private:
   [[nodiscard]] std::optional<Solution> assemble_routes(
-      const Solution& local, const std::optional<Solution>& best,
-      std::size_t iteration, GurobiDeadline deadline,
+      Solution& local, const std::optional<Solution>& best,
+      std::size_t iteration, CoptDeadline deadline,
+      detail::FrvcpActiveWallBudget& frvcp_budget,
       const std::function<void(const ExactStageProgress&)>& exact_progress);
   [[nodiscard]] bool pool_covers_all_customers(
       const std::vector<RouteColumn>& columns) const;
@@ -245,13 +317,14 @@ class IlsSpSolver {
   Perturbation perturbation_;
   VariableNeighborhoodDescent vnd_;
   RoutePool pool_;
-  GurobiSetPartitioning set_partitioning_;
-  GurobiFrvcp frvcp_;
+  CoptSetPartitioning set_partitioning_;
+  CoptFrvcp frvcp_;
   std::vector<std::vector<int>> previous_sp_customer_sets_;
   double penalty_lambda_{};
   std::size_t consecutive_feasible_{0};
   std::size_t consecutive_infeasible_{0};
   std::size_t sp_calls_{0};
+  std::size_t sp_skipped_incomplete_pool_{0};
   std::size_t adaptive_sp_calls_{0};
   std::size_t last_sp_iteration_{0};
   std::uint64_t pool_effective_generation_at_last_sp_{0};

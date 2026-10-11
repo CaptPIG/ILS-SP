@@ -1,19 +1,249 @@
 #include "ils_sp/search.hpp"
 
+#ifndef ILS_SP_PACKED_DFS_MASK
+#define ILS_SP_PACKED_DFS_MASK 0
+#endif
+
+#ifndef ILS_SP_TYPED_DELETE_ENTRY
+#define ILS_SP_TYPED_DELETE_ENTRY 0
+#endif
+
+#ifndef ILS_SP_FORWARD_ONLY_TWO_OPT
+#define ILS_SP_FORWARD_ONLY_TWO_OPT 0
+#endif
+
+#ifndef ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD
+#define ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD 0
+#endif
+#include "ils_sp/detail/xxhash_api.hpp"
+
 #include <algorithm>
 #include <bit>
+#include <cerrno>
+#include <charconv>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <fcntl.h>
+#include <linux/fs.h>
 #include <limits>
 #include <numeric>
 #include <queue>
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
+#include <sys/vfs.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 namespace ils_sp {
 namespace {
 
+#if ILS_SP_PACKED_DFS_MASK
+// The caller checks nonzero. Clearing the lowest set bit preserves the
+// original ascending station-index DFS order, including shared prefixes.
+[[nodiscard]] std::size_t take_lowest_station_index(
+    std::uint32_t& remaining) noexcept {
+  const auto index = static_cast<std::size_t>(std::countr_zero(remaining));
+  remaining &= remaining - 1;
+  return index;
+}
+#endif
+
+// Decision-local physical labels. Customer cut k is immediately after customer
+// k-1 (or the departure depot for k=0), leaving the following CS chain in the
+// suffix. No charging amounts are inherited; reverse edges are built afresh.
+class PhysicalReverseTwoOptProfile {
+ public:
+  PhysicalReverseTwoOptProfile(const Instance& instance, const Plan& plan,
+                              const NonlinearSequenceEvaluator& evaluator)
+      : visits_(plan.route.visits), cuts_{0},
+        prefix_(visits_.size() + 1), reverse_prefix_(visits_.size() + 1),
+        suffix_(visits_.size() + 1), reverse_suffix_(visits_.size() + 1) {
+    for (std::size_t p = 0; p < visits_.size(); ++p) {
+      if (instance.node(visits_[p]).kind == NodeKind::Customer) cuts_.push_back(p + 1);
+    }
+    if (cuts_.size() != plan.customer_ids.size() + 1) {
+      throw std::logic_error("physical 2OPT customer metadata differs");
+    }
+    // Ordinary customer cut n remains before its trailing station chain.
+    // Only the structural depot-edge descriptor uses n+1: the physical end.
+    cuts_.push_back(visits_.size());
+    for (std::size_t end = 2; end <= visits_.size(); ++end) {
+      prefix_[end] = evaluator.concatenate(prefix_[end - 1],
+          evaluator.edge_label(visits_[end - 2], {}, visits_[end - 1]));
+      reverse_prefix_[end] = evaluator.concatenate(
+          evaluator.edge_label(visits_[end - 1], {}, visits_[end - 2]),
+          reverse_prefix_[end - 1]);
+    }
+    for (std::size_t begin = visits_.size(); begin-- > 0;) {
+      if (begin + 1 == visits_.size()) continue;
+      suffix_[begin] = evaluator.concatenate(
+          evaluator.edge_label(visits_[begin], {}, visits_[begin + 1]),
+          suffix_[begin + 1]);
+      reverse_suffix_[begin] = evaluator.concatenate(reverse_suffix_[begin + 1],
+          evaluator.edge_label(visits_[begin + 1], {}, visits_[begin]));
+    }
+  }
+
+  void append_label(std::size_t customer_cut, bool prefix, bool reversed,
+                    ChargingSequenceLabel& label, int& previous,
+                    const NonlinearSequenceEvaluator& evaluator) const {
+    const std::size_t cut = cuts_.at(customer_cut);
+    const std::size_t begin = prefix ? 0 : cut;
+    const std::size_t end = prefix ? cut : visits_.size();
+    if (begin == end) return;
+    const int first = visits_[reversed ? end - 1 : begin];
+    evaluator.append(label, evaluator.edge_label(previous, {}, first));
+    evaluator.append(label, prefix
+        ? (reversed ? reverse_prefix_[end] : prefix_[end])
+        : (reversed ? reverse_suffix_[begin] : suffix_[begin]));
+    previous = visits_[reversed ? begin : end - 1];
+  }
+
+  void append_visits(std::size_t customer_cut, bool prefix, bool reversed,
+                     std::vector<int>& result) const {
+    const std::size_t cut = cuts_.at(customer_cut);
+    const std::size_t begin = prefix ? 0 : cut;
+    const std::size_t end = prefix ? cut : visits_.size();
+    if (reversed) {
+      for (std::size_t p = end; p > begin; --p) result.push_back(visits_[p - 1]);
+    } else {
+      result.insert(result.end(), visits_.begin() + static_cast<std::ptrdiff_t>(begin),
+                    visits_.begin() + static_cast<std::ptrdiff_t>(end));
+    }
+  }
+
+ private:
+  std::vector<int> visits_;
+  std::vector<std::size_t> cuts_;
+  std::vector<ChargingSequenceLabel> prefix_, reverse_prefix_, suffix_, reverse_suffix_;
+};
+
 constexpr double kLinkedBoundSafety = 100.0 * kCostTolerance;
+
+bool supported_bound_fp_environment() noexcept {
+#if defined(__x86_64__) && !defined(__FAST_MATH__) && \
+    (!defined(__FINITE_MATH_ONLY__) || __FINITE_MATH_ONLY__ == 0)
+  unsigned short control;
+  asm volatile("fnstcw %0" : "=m"(control));
+  const unsigned csr = _mm_getcsr();
+  return (control & 0x003f) == 0x003f && (control & 0x0c00) == 0 &&
+         (csr & 0x1f80) == 0x1f80 && (csr & 0xe040) == 0;
+#else
+  return false;
+#endif
+}
+
+// This is a certificate for the actual double implementation, not merely for
+// the mathematical PWL curve. Unsupported inputs keep the original evaluator.
+bool certifies_nonlinear_travel_bound(const Instance& instance) {
+  if (!supported_bound_fp_environment()) return false;
+  const auto& vehicle = instance.vehicle();
+  const double capacity = vehicle.battery_capacity_wh;
+  if (capacity < 1e-6 || capacity > 1e6 ||
+      vehicle.speed_kmph < 1e-6 || vehicle.consumption_wh_per_km < 1e-6 ||
+      vehicle.max_route_duration_h < 1e-6 ||
+      vehicle.max_route_duration_h > 1e6) return false;
+  for (const auto& node : instance.nodes()) {
+    if (node.service_time_h > 1e6) return false;
+    for (const auto& target : instance.nodes()) {
+      const double energy = instance.energy_wh(node.id, target.id);
+      if (!std::isfinite(energy) || energy < 0.0 || energy > 1e6) return false;
+      const double travel = instance.travel_time_h(node.id, target.id);
+      if (!std::isfinite(travel) || travel < 0.0 || travel > 1e9) return false;
+    }
+  }
+  for (const int id : instance.station_ids()) {
+    const auto& curve = instance.curve_for_station(id);
+    const auto& points = curve.points();
+    if (curve.capacity_wh() != capacity || points.front().time_h != 0.0 ||
+        points.front().energy_wh != 0.0) return false;
+    for (std::size_t index = 0; index < points.size(); ++index) {
+      const auto& point = points[index];
+      if (point.time_h > 1e6 ||
+          !std::isfinite(curve.time_at_energy(point.energy_wh))) return false;
+      if (index != 0) {
+        const double energy_width = point.energy_wh - points[index - 1].energy_wh;
+        const double time_width = point.time_h - points[index - 1].time_h;
+        if ((energy_width > 0.0 && energy_width < 1e-6) ||
+            (time_width > 0.0 && time_width < 1e-12)) return false;
+      }
+      // Zero and the clamped capacity have no downward join. Within a segment
+      // all positive-width interpolation operations are monotone. Test every
+      // other join using the original function and the next representable E.
+      if (point.energy_wh > 0.0 && point.energy_wh < capacity &&
+          curve.time_at_energy(point.energy_wh) > curve.time_at_energy(
+              std::nextafter(point.energy_wh,
+                             std::numeric_limits<double>::infinity()))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::optional<double> nonlinear_travel_bound(
+    double travel, double service, std::size_t station_count,
+    const Vehicle& vehicle, double lambda) {
+  if (station_count > 62 ||
+      !std::isfinite(travel) || travel < 0.0 || travel > 1e12 ||
+      !std::isfinite(service) || service < 0.0 || service > 1e12 ||
+      !std::isfinite(lambda) ||
+      (lambda != 0.0 && (lambda < 1e-6 || lambda > 1e4))) return std::nullopt;
+  const double no_charge_duration = travel + service;
+  const double excess =
+      std::max(0.0, no_charge_duration - vehicle.max_route_duration_h);
+  if (lambda == 0.0 || excess == 0.0) return travel;
+  const double downward = -std::numeric_limits<double>::infinity();
+  const double penalty = std::max(0.0, std::nextafter(lambda * excess, downward));
+  if (penalty == 0.0) return travel;
+  return std::max(0.0, std::nextafter(travel + penalty, downward));
+}
+
+std::optional<double> linked_triangle_slack(const Instance& instance,
+                                            bool data_certified) {
+  if (!data_certified || instance.station_ids().size() > 31) return std::nullopt;
+  const double down = -std::numeric_limits<double>::infinity();
+  const double up = std::numeric_limits<double>::infinity();
+  double slack = 0.0;
+  for (const auto& a : instance.nodes()) {
+    for (const auto& b : instance.nodes()) {
+      const double direct = instance.travel_time_h(a.id, b.id);
+      for (const int station : instance.station_ids()) {
+        const double via = std::nextafter(
+            instance.travel_time_h(a.id, station) +
+                instance.travel_time_h(station, b.id), down);
+        slack = std::max(slack, std::nextafter(direct - via, up));
+      }
+    }
+  }
+  return slack;
+}
+
+// Literal customer-only opening: the existing route retains every station
+// occurrence in parent order; the new empty route receives only the customer.
+// Charging and infeasibility are evaluated afresh by the unchanged evaluator.
+std::vector<int> project_opening_visits(const Instance& instance,
+                                      const Plan& parent, int moved_customer,
+                                      bool singleton_child) {
+  if (singleton_child) return {moved_customer};
+  std::vector<int> visits;
+  visits.reserve(parent.route.visits.size());
+  for (int id : parent.route.visits) {
+    if (instance.node(id).kind == NodeKind::Station || id != moved_customer) {
+      visits.push_back(id);
+    }
+  }
+  return visits;
+}
 
 template <typename Container>
 std::size_t random_index(const Container& values, std::mt19937_64& random) {
@@ -162,54 +392,15 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
   return result;
 }
 
-// Optimistic relaxation for a linked insertion candidate.  It keeps the
-// direct/inherited travel and service, allows charging anywhere at the global
-// fastest marginal rate, and ignores capacity/reachability constraints.  It
-// therefore cannot exceed the cost returned by repair_new_gaps().
+// No energy/rate conservation claim is valid for tolerance-clamped Algorithm 3.
+// The per-instance certificate below bounds only travel and unavoidable horizon.
 [[nodiscard]] double linked_route_lower_bound(
-    const RouteCostSummary& summary, const Instance& instance,
-    double penalty_lambda, double maximum_rate_wh_per_h) {
-  const long double travel = summary.travel_time_h;
-  const long double service = summary.service_time_h;
-  const long double speed = instance.vehicle().speed_kmph;
-  const long double consumption =
-      instance.vehicle().consumption_wh_per_km;
-  const long double capacity = instance.vehicle().battery_capacity_wh;
-  const long double maximum_duration =
-      instance.vehicle().max_route_duration_h;
-  const long double lambda = penalty_lambda;
-  const long double required_energy = std::max(
-      0.0L, travel * speed * consumption - capacity);
-
-  const auto relaxed_cost = [&](long double charged_energy) {
-    long double charging_time = 0.0L;
-    if (charged_energy > 0.0L) {
-      if (maximum_rate_wh_per_h <= 0.0) {
-        return std::numeric_limits<long double>::infinity();
-      }
-      if (std::isfinite(maximum_rate_wh_per_h)) {
-        charging_time = charged_energy / maximum_rate_wh_per_h;
-      }
-    }
-    const long double shortfall =
-        std::max(0.0L, required_energy - charged_energy) / consumption;
-    const long double duration_excess = std::max(
-        0.0L, travel + service + charging_time - maximum_duration);
-    return travel + charging_time + lambda * (shortfall + duration_excess);
-  };
-
-  long double lower_bound = relaxed_cost(0.0L);
-  lower_bound = std::min(lower_bound, relaxed_cost(required_energy));
-  if (std::isfinite(maximum_rate_wh_per_h) &&
-      maximum_rate_wh_per_h > 0.0) {
-    const long double duration_kink = std::clamp(
-        static_cast<long double>(maximum_rate_wh_per_h) *
-            (maximum_duration - travel - service),
-        0.0L, required_energy);
-    lower_bound = std::min(lower_bound, relaxed_cost(duration_kink));
-  }
-  return std::nextafter(static_cast<double>(lower_bound),
-                        -std::numeric_limits<double>::infinity());
+    const RouteCostSummary& summary, const Instance&,
+    double penalty_lambda, const PathSampler* sampler,
+    std::size_t source_visits = 0, std::size_t source_customers = 0) {
+  return sampler ? sampler->linked_insertion_lower_bound(
+                       summary, penalty_lambda, source_visits, source_customers)
+                 : -std::numeric_limits<double>::infinity();
 }
 
 [[nodiscard]] std::vector<int> insertion_sequence(
@@ -233,7 +424,7 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
 [[nodiscard]] std::vector<InsertionMove> insertion_moves(
     const Solution& current, int customer_id, const Instance& instance,
     const RouteSequenceScorer& scorer, double penalty_lambda,
-    bool calculate_linked_lower_bound, double maximum_rate_wh_per_h,
+    bool calculate_linked_lower_bound, const PathSampler* linked_bound_sampler,
     bool rank_by_linked_lower_bound = false,
     const GranularNeighborhood* granular = nullptr,
     std::uint64_t* granular_rejections = nullptr,
@@ -268,7 +459,8 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
       if (calculate_linked_lower_bound) {
         lower_bound = std::nextafter(
             linked_route_lower_bound(summary, instance, penalty_lambda,
-                                     maximum_rate_wh_per_h) -
+                                     linked_bound_sampler, old_plan.route.visits.size(),
+                                     old_plan.customer_ids.size()) -
                 old_cost,
             -std::numeric_limits<double>::infinity());
       }
@@ -296,7 +488,7 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
         generalized_cost(singleton_summary, instance, penalty_lambda);
     singleton_lower_bound = linked_route_lower_bound(
         singleton_summary, instance, penalty_lambda,
-        maximum_rate_wh_per_h);
+        linked_bound_sampler);
   } else {
     singleton_cost = sequence_cost(singleton, scorer, penalty_lambda);
     singleton_lower_bound = singleton_cost;
@@ -325,7 +517,7 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
 [[nodiscard]] InsertionMove rejected_insertion_move(
     const Solution& current, const RejectedInsertionDescriptor& descriptor,
     const Instance& instance, const RouteSequenceScorer& scorer,
-    double penalty_lambda, double maximum_rate_wh_per_h) {
+    double penalty_lambda, const PathSampler* linked_bound_sampler) {
   if (descriptor.route_index >= current.plans.size()) {
     throw std::out_of_range("granular escape has invalid route");
   }
@@ -338,7 +530,8 @@ constexpr std::size_t kVirtualInsertionCompletionMemoCapacity = 8'192;
       generalized_cost(summary, instance, penalty_lambda);
   const double lower_bound = std::nextafter(
       linked_route_lower_bound(summary, instance, penalty_lambda,
-                               maximum_rate_wh_per_h) -
+                               linked_bound_sampler, old_plan.route.visits.size(),
+                               old_plan.customer_ids.size()) -
           old_cost,
       -std::numeric_limits<double>::infinity());
   return InsertionMove{.customer_id = descriptor.customer_id,
@@ -359,7 +552,7 @@ void append_granular_escape(
     const std::vector<RejectedInsertionDescriptor>& rejected,
     const Solution& current, const Instance& instance,
     const RouteSequenceScorer& scorer, double penalty_lambda,
-    double maximum_rate_wh_per_h, std::mt19937_64& random,
+    const PathSampler* linked_bound_sampler, std::mt19937_64& random,
     InsertionCandidateStatistics& statistics) {
   statistics.granular_escape_candidates_seen += rejected.size();
   if (rejected.empty()) return;
@@ -367,7 +560,7 @@ void append_granular_escape(
       rejected[random_index(rejected, random)];
   candidates.push_back(rejected_insertion_move(
       current, selected, instance, scorer, penalty_lambda,
-      maximum_rate_wh_per_h));
+      linked_bound_sampler));
   ++statistics.granular_escape_candidates_selected;
 }
 
@@ -430,7 +623,8 @@ void evaluate_linked_insertion(
     const PlanFactory::GapMap& reference_gaps, double penalty_lambda,
     InsertionCandidateStatistics& statistics,
     InsertionCompletionMemo& completion_memo,
-    bool repair_affected_paths = false) {
+    bool repair_affected_paths = false,
+    bool single_step_completion = false) {
   if (move.evaluated) return;
   InsertionCompletionKey memo_key{
       .source_physical_visits =
@@ -461,7 +655,8 @@ void evaluate_linked_insertion(
       // introduced gap.  Any station detour has nonnegative travel and
       // charging time.
       completed = path_sampler.repair_new_gaps(
-          std::move(completed), reference_gaps, penalty_lambda);
+          std::move(completed), reference_gaps, penalty_lambda, std::nullopt,
+          single_step_completion);
     }
     const double absolute_cost =
         generalized_cost(*completed.evaluation, instance, penalty_lambda);
@@ -583,7 +778,8 @@ struct DirectCustomerInsertionRanking {
     const Instance& instance, PlanFactory& factory, PathSampler& path_sampler,
     const PlanFactory::GapMap& reference_gaps, double penalty_lambda,
     InsertionCandidateStatistics& statistics,
-    InsertionCompletionMemo& completion_memo) {
+    InsertionCompletionMemo& completion_memo,
+    bool single_step_completion = false) {
   if (moves.empty()) throw std::logic_error("no insertion candidate exists");
   ++statistics.decisions;
   ++statistics.greedy_decisions;
@@ -596,7 +792,8 @@ struct DirectCustomerInsertionRanking {
   const InsertionMove direct_identity = moves[direct_index];
   evaluate_linked_insertion(moves[direct_index], current, instance, factory,
                             path_sampler, reference_gaps, penalty_lambda,
-                            statistics, completion_memo);
+                            statistics, completion_memo, false,
+                            single_step_completion);
   const double completed_direct_delta = moves[direct_index].delta;
   std::size_t best_index = direct_index;
 
@@ -610,7 +807,8 @@ struct DirectCustomerInsertionRanking {
     }
     evaluate_linked_insertion(moves[index], current, instance, factory,
                               path_sampler, reference_gaps, penalty_lambda,
-                              statistics, completion_memo);
+                              statistics, completion_memo, false,
+                              single_step_completion);
     if (insertion_better(moves[index], moves[best_index])) {
       moves[best_index].completion.reset();
       best_index = index;
@@ -651,7 +849,7 @@ struct CustomerInsertionRanking {
     InsertionCandidateStatistics& statistics,
     InsertionCompletionMemo& completion_memo,
     std::optional<double> incumbent_linked_regret,
-    bool require_complete_ranking) {
+    bool require_complete_ranking, bool single_step_completion) {
   statistics.candidates_generated += moves.size();
   const std::size_t direct_best_index = *direct.indices.best;
   InsertionMove direct_best = direct.best;
@@ -660,7 +858,8 @@ struct CustomerInsertionRanking {
   const auto evaluate_and_rank = [&](std::size_t index) {
     evaluate_linked_insertion(moves[index], current, instance, factory,
                               path_sampler, reference_gaps, penalty_lambda,
-                              statistics, completion_memo);
+                              statistics, completion_memo, false,
+                              single_step_completion);
     const std::optional<std::size_t> previous_best = exact.best;
     consider_best_two(exact, index, [&](std::size_t left,
                                         std::size_t right) {
@@ -752,7 +951,8 @@ struct CustomerInsertionRanking {
                                  double incumbent_regret,
                                  const InsertionMove& incumbent) {
   return candidate_regret > incumbent_regret + kCostTolerance ||
-         (std::abs(candidate_regret - incumbent_regret) <= kCostTolerance &&
+         ((candidate_regret == incumbent_regret ||
+           std::abs(candidate_regret - incumbent_regret) <= kCostTolerance) &&
           insertion_better(candidate, incumbent));
 }
 
@@ -761,9 +961,10 @@ struct CustomerInsertionRanking {
     const Instance& instance, PlanFactory& factory, PathSampler& path_sampler,
     const RouteSequenceScorer& scorer,
     const PlanFactory::GapMap& reference_gaps, double penalty_lambda,
-    double maximum_rate_wh_per_h,
+    const PathSampler* linked_bound_sampler,
     InsertionCandidateStatistics& statistics,
-    InsertionCompletionMemo& completion_memo) {
+    InsertionCompletionMemo& completion_memo,
+    bool single_step_completion = false) {
   ++statistics.decisions;
   ++statistics.two_regret_decisions;
   struct PreparedCustomerRanking {
@@ -775,7 +976,7 @@ struct CustomerInsertionRanking {
   for (const int customer_id : unassigned) {
     std::vector<InsertionMove> moves = insertion_moves(
         current, customer_id, instance, scorer, penalty_lambda, true,
-        maximum_rate_wh_per_h);
+        linked_bound_sampler);
     DirectCustomerInsertionRanking direct =
         direct_customer_ranking(moves);
     prepared.push_back(PreparedCustomerRanking{
@@ -802,7 +1003,7 @@ struct CustomerInsertionRanking {
         linked_winner.has_value()
             ? std::optional<double>{linked_winner->linked_regret}
             : std::nullopt,
-        index == direct_winner_index);
+        index == direct_winner_index, single_step_completion);
     if (index == direct_winner_index) {
       if (!linked.has_value()) {
         throw std::logic_error(
@@ -1207,6 +1408,90 @@ void accumulate_dirty_direct_anchor_pairs(
 
 }  // namespace
 
+// A conservative lower bound, not an exact label travel value. The catalog's
+// distance includes prefix-first subtraction and reconstruction. For <=63
+// legs, 512 epsilon covers both that rounding and per-leg division/summing;
+// 512 denorm_min covers gradual underflow. See the audit's suffix proof.
+double PathSampler::catalog_travel_lower_bound(double distance, double speed) {
+  const double downward = -std::numeric_limits<double>::infinity();
+  const double factor = 1.0 - 512.0 * std::numeric_limits<double>::epsilon();
+  const double scaled = std::nextafter((distance / speed) * factor, downward);
+  return std::max(0.0, std::nextafter(
+      scaled - 512.0 * std::numeric_limits<double>::denorm_min(), downward));
+}
+
+double PathSampler::linked_insertion_lower_bound(
+    const RouteCostSummary& summary, double lambda,
+    std::size_t source_visits, std::size_t source_customers) const {
+  const double disabled = -std::numeric_limits<double>::infinity();
+  const std::size_t stations = instance_.station_ids().size();
+  // New insertions create exactly two direct gaps. Each catalogue path is
+  // simple, hence can add at most m stations per gap. Inherited gaps are fixed.
+  // Bound both the LabelTree and completed sequential sums by physical legs.
+  if (!complete_paths_ || implicit_replacement_ || !linked_triangle_slack_h_ ||
+      !supported_bound_fp_environment() ||
+      source_customers > source_visits || source_visits > 317 || stations > 31)
+    return disabled;
+  const std::size_t inserted_stations = 2 * stations;
+  const std::size_t legs = source_visits + 2 + inserted_stations;
+  const std::size_t total_stations =
+      source_visits - source_customers + inserted_stations;
+  if (legs > 319 || total_stations > 62 ||
+      !nonlinear_travel_bound(summary.travel_time_h, summary.service_time_h,
+                              total_stations, instance_.vehicle(), lambda))
+    return disabled;
+  const double down = -std::numeric_limits<double>::infinity();
+  const double up = std::numeric_limits<double>::infinity();
+  // For nonnegative sums with <=L additions, gamma_L covers any addition tree.
+  // (1-gamma_L)/(1+gamma_L) >= 1-4*L*epsilon in this L<=319 envelope.
+  // The explicit denormal allowance also covers gradual-underflow additions.
+  const double factor = std::nextafter(
+      1.0 - (4.0 * static_cast<double>(legs)) *
+                  std::numeric_limits<double>::epsilon(), down);
+  const double underflow = std::nextafter(
+      (4.0 * static_cast<double>(legs)) *
+          std::numeric_limits<double>::denorm_min(), up);
+  const double detour_slack = std::nextafter(
+      static_cast<double>(inserted_stations) * *linked_triangle_slack_h_, up);
+  const auto lower_sum = [&](double value, double removed_slack) {
+    return std::max(0.0, std::nextafter(
+        std::nextafter(std::nextafter(value * factor, down) - removed_slack,
+                       down) - underflow, down));
+  };
+  const double travel = lower_sum(summary.travel_time_h, detour_slack);
+  const double service = lower_sum(summary.service_time_h, 0.0);
+  // Certified actual charging is nonnegative. The existing directed-rounding
+  // kernel bounds travel + lambda*max(0,travel+service-Tmax); energy is omitted.
+  return nonlinear_travel_bound(travel, service, total_stations,
+                                 instance_.vehicle(), lambda).value_or(disabled);
+}
+
+std::optional<double> PathSampler::zero_shift_energy_cost_bound(
+    double travel, double service, const Vehicle& vehicle, double lambda) {
+  // Caller certifies original finite-rate zero-shift propagation, canonical
+  // <=319 physical legs, <=62 CS, and the existing data/FP envelope. Restrict
+  // both conversion factors as well to bound gradual-underflow amplification.
+  if (vehicle.speed_kmph > 1e6 || vehicle.consumption_wh_per_km > 1e6 ||
+      !nonlinear_travel_bound(travel, service, 62, vehicle, lambda))
+    return std::nullopt;
+  const double no_charge_duration = travel + service;
+  if (no_charge_duration < vehicle.max_route_duration_h) return std::nullopt;
+  const double energy = (travel * vehicle.speed_kmph) * vehicle.consumption_wh_per_km;
+  if (!std::isfinite(energy) || energy > 4e8) return std::nullopt;
+  // In this scope there is no actual charging. Original tolerance and all
+  // travel/energy summation, conversion, SOC subtraction and deficit summation
+  // errors total <2e-4 Wh (audit). Never use exact conservation or charge/rate.
+  constexpr double kEnergyRoundoffAllowanceWh = 1e-3;
+  const double downward = -std::numeric_limits<double>::infinity();
+  const double deficit = std::nextafter(
+      std::nextafter(energy - vehicle.battery_capacity_wh, downward) -
+          kEnergyRoundoffAllowanceWh, downward);
+  const double energy_penalty =
+      std::max(0.0, deficit) / vehicle.consumption_wh_per_km;
+  return travel + lambda * (energy_penalty +
+      std::max(0.0, no_charge_duration - vehicle.max_route_duration_h));
+}
+
 GranularNeighborhood::GranularNeighborhood(const Instance& instance,
                                            std::size_t maximum_neighbors) {
   if (maximum_neighbors == 0) {
@@ -1214,12 +1499,21 @@ GranularNeighborhood::GranularNeighborhood(const Instance& instance,
   }
   const std::size_t count = instance.customer_ids().size();
   customer_rank_by_id_.reserve(count);
+  consecutive_customer_ids_ = true;
   for (std::size_t rank = 0; rank < count; ++rank) {
-    customer_rank_by_id_.emplace(instance.customer_ids()[rank], rank);
+    const int customer = instance.customer_ids()[rank];
+    if (customer <= 0 || static_cast<std::size_t>(customer) != rank + 1) {
+      consecutive_customer_ids_ = false;
+    }
+    customer_rank_by_id_.emplace(customer, rank);
   }
   promising_matrix_.assign(count * count, 0);
   if (count <= 1) {
     gamma_size_ = 0;
+    for (const int customer : instance.customer_ids()) {
+      directed_neighbors_.try_emplace(customer);
+      promising_neighbors_.try_emplace(customer);
+    }
     return;
   }
   gamma_size_ = std::min(count - 1, maximum_neighbors);
@@ -1280,6 +1574,10 @@ std::uint64_t GranularNeighborhood::edge_key(int left_id, int right_id) {
 }
 
 std::size_t GranularNeighborhood::customer_rank(int customer_id) const {
+  if (consecutive_customer_ids_ && customer_id > 0 &&
+      static_cast<std::size_t>(customer_id) <= customer_rank_by_id_.size()) {
+    return static_cast<std::size_t>(customer_id - 1);
+  }
   return customer_rank_by_id_.at(customer_id);
 }
 
@@ -1293,6 +1591,14 @@ bool GranularNeighborhood::promising_by_rank(std::size_t left_rank,
 }
 
 bool GranularNeighborhood::promising(int left_id, int right_id) const {
+  if (consecutive_customer_ids_) {
+    const std::size_t count = customer_rank_by_id_.size();
+    if (left_id <= 0 || right_id <= 0 ||
+        static_cast<std::size_t>(left_id) > count ||
+        static_cast<std::size_t>(right_id) > count) return false;
+    return promising_matrix_[(static_cast<std::size_t>(left_id) - 1) * count +
+                             static_cast<std::size_t>(right_id) - 1] != 0;
+  }
   const auto left = customer_rank_by_id_.find(left_id);
   const auto right = customer_rank_by_id_.find(right_id);
   return left != customer_rank_by_id_.end() &&
@@ -1338,17 +1644,104 @@ bool GranularNeighborhood::allows(
       if (promising_edges_.contains(edge)) return true;
     }
   }
-  // Vidal's restriction requires every tested move to introduce at least one
-  // promising customer arc; depot-only changes have no such arc.
+  // Generic new-arc query, not an operator-specific VND predicate. Each VND
+  // customer operator supplies its own entry/reconnection condition before
+  // scoring; empty-segment/depot mappings are documented in audit section 5.15.
+  // Depot-only changes have no customer arc to satisfy this guard.
   return false;
 }
 
+std::uint64_t PathSampler::PathCatalog::encode_path(
+    std::span<const int> stations, std::uint32_t flat_offset) const {
+  if (!packed) {
+    return static_cast<std::uint64_t>(flat_offset) |
+        (static_cast<std::uint64_t>(stations.size()) << 32);
+  }
+  if (stations.size() > packed_station_ids.size()) {
+    throw std::length_error("packed station path is too long");
+  }
+  const auto known =
+      std::span<const int>{packed_station_ids}.first(packed_station_count);
+  std::uint64_t encoded = 0;
+  for (std::size_t index = 0; index < stations.size(); ++index) {
+    const auto found =
+        std::lower_bound(known.begin(), known.end(), stations[index]);
+    if (found == known.end() || *found != stations[index]) {
+      throw std::invalid_argument("packed path contains an unknown station");
+    }
+    const auto code = static_cast<std::uint64_t>(found - known.begin() + 1);
+    encoded |= code << (60 - 4 * index);
+  }
+  return encoded;
+}
+
+std::size_t PathSampler::PathCatalog::path_size(
+    const PathDescriptor& path) const noexcept {
+  if (!packed) return static_cast<std::uint32_t>(path.station_storage >> 32);
+  // All used nibbles are nonzero and the lowest nibble is always a sentinel.
+  // countr_zero(0) is 64, so the empty path needs no special representation.
+  return 16 - static_cast<std::size_t>(std::countr_zero(path.station_storage)) / 4;
+}
+
+std::span<const int> PathSampler::PathCatalog::stations(
+    const PathDescriptor& path, DecodeBuffer& decoded) const {
+  const std::size_t size = path_size(path);
+  if (!packed) {
+    return std::span<const int>{station_ids}.subspan(
+        static_cast<std::uint32_t>(path.station_storage), size);
+  }
+  for (std::size_t index = 0; index < size; ++index) {
+    const auto code = static_cast<std::size_t>(
+        (path.station_storage >> (60 - 4 * index)) & 15);
+    decoded[index] = packed_station_ids[code - 1];
+  }
+  return std::span<const int>{decoded}.first(size);
+}
+
+bool PathSampler::PathCatalog::lexically_less(
+    const PathDescriptor& left, const PathDescriptor& right) const {
+  // Sorted station ranks and zero trailing nibbles preserve the original
+  // integer-ID lexicographic order, including a shorter shared prefix.
+  if (packed) return left.station_storage < right.station_storage;
+  DecodeBuffer left_buffer, right_buffer;
+  const auto first = stations(left, left_buffer);
+  const auto second = stations(right, right_buffer);
+  return std::lexicographical_compare(first.begin(), first.end(),
+                                      second.begin(), second.end());
+}
+
+std::size_t PathSampler::PathCatalog::retained_bytes() const noexcept {
+  if (disk_backing) {
+    const auto& header = disk_backing->header;
+    return sizeof(PathCatalogPayload) + header[11] * sizeof(PathDescriptor) +
+        header[12] * sizeof(int) + header[13] * sizeof(std::uint32_t) + 256;
+  }
+  return sizeof(PathCatalogPayload) + paths.capacity() * sizeof(PathDescriptor) +
+      station_ids.capacity() * sizeof(int) +
+      lexical_order.capacity() * sizeof(std::uint32_t) + 256;
+}
+
+std::size_t PathSampler::PathCatalog::size() const noexcept {
+  return disk_backing ? static_cast<std::size_t>(disk_backing->header[8]) : paths.size();
+}
+
+#include "catalog_disk_cache.inc"
+
 PathSampler::PathSampler(const Instance& instance, PlanFactory& factory,
-                         std::mt19937_64& random)
-    : instance_(instance), factory_(factory), random_(random) {
+                         std::mt19937_64& random, bool complete_paths,
+                         bool implicit_replacement)
+    : instance_(instance), factory_(factory), random_(random),
+      complete_paths_(complete_paths), implicit_replacement_(implicit_replacement),
+      maximum_charging_rate_wh_per_h_(maximum_charging_rate(instance)) {
   build_curve_order();
   build_reachable_station_index();
-  build_shortest_station_paths();
+  if (!complete_paths_) build_shortest_station_paths();
+  replacement_summary_statistics_.bound_certified =
+      certifies_nonlinear_travel_bound(instance_);
+  linked_triangle_slack_h_ = linked_triangle_slack(
+      instance_, complete_paths_ && !implicit_replacement_ &&
+                     replacement_summary_statistics_.bound_certified);
+  initialize_catalog_disk_cache();
 }
 
 void PathSampler::build_curve_order() {
@@ -1553,87 +1946,434 @@ void PathSampler::build_shortest_station_paths() {
   }
 }
 
-std::vector<std::vector<int>> PathSampler::alternatives(
+std::optional<std::vector<int>> PathSampler::sample_explicit_path(
     int origin_id, int target_id, const std::vector<int>& current_path) {
-  const auto options = path_options(origin_id, target_id);
-  std::vector<std::vector<int>> result;
-  result.reserve(options->size());
-  for (const auto& option : *options) {
-    if (option.stations != current_path) result.push_back(option.stations);
-  }
-  std::sort(result.begin(), result.end());
+  const auto catalog = path_catalog(origin_id, target_id);
+  CatalogReader reader(*catalog);
+  PathCatalog::DecodeBuffer decoded;
+  const auto [first, last] = reader.equal_range(current_path);
+  // Same sorted multiset, all copies excluded, same one uniform-size_t draw.
+  const std::size_t excluded = last - first;
+  const std::size_t available = catalog->size() - excluded;
+  if (available == 0) return std::nullopt;
+  // A lazy read can fail after the ordinal is selected. Commit the engine
+  // only after the selected physical path is fully read and materialized.
+  // Resident catalogues retain the original direct-RNG fast path.
+  std::optional<std::mt19937_64> pending_random;
+  if (catalog->disk_backing) pending_random.emplace(random_);
+  auto& engine = pending_random ? *pending_random : random_;
+  std::size_t ordinal =
+      std::uniform_int_distribution<std::size_t>(0, available - 1)(engine);
+  if (ordinal >= first) ordinal += excluded;
+  const auto stations = catalog->stations(
+      reader.descriptor(reader.lexical_index(ordinal)), decoded);
+  std::vector<int> result(stations.begin(), stations.end());
+  if (pending_random) random_ = *pending_random;
   return result;
 }
 
-std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
-    int origin_id, int target_id, RepairTimingStatistics* timing) {
+std::shared_ptr<const PathSampler::PathCatalog> PathSampler::path_catalog(
+    int origin_id, int target_id, RepairTimingStatistics* timing,
+    PathCatalogStatistics* statistics) {
+  if (statistics != nullptr) *statistics = {};
   const AnchorPair key{origin_id, target_id};
-  if (auto cached = option_cache_.get(key); cached.has_value()) {
+  if (auto cached = catalog_cache_.get(key); cached.has_value()) {
     if (timing != nullptr) ++timing->path_option_cache_hits;
+    if (statistics != nullptr) statistics->cache_hit = true;
     return *cached;
   }
   if (timing != nullptr) ++timing->path_option_cache_misses;
+  const auto disk_started = catalog_disk_cache_.enabled &&
+      (timing != nullptr || statistics != nullptr)
+      ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  if (auto restored = disk_cache_load(key)) {
+    // Same object lifetime and RAM admission as an ordinary rebuild. In
+    // particular, old weak_ptr physical-summary rows are not resurrected.
+    const auto evictions_before = catalog_cache_.evictions();
+    const std::size_t bytes = restored->retained_bytes();
+    if (bytes <= catalog_cache_budget_) {
+      while (catalog_cache_.size() != 0 &&
+             catalog_cache_bytes_ + bytes > catalog_cache_budget_) {
+        const auto evicted = catalog_cache_.discard_oldest();
+        catalog_cache_bytes_ -= (*evicted)->retained_bytes();
+      }
+      catalog_cache_.put(key, restored);
+      catalog_cache_bytes_ += bytes;
+    }
+    if (timing != nullptr) {
+      timing->path_option_cache_evictions +=
+          catalog_cache_.evictions() - evictions_before;
+      timing->path_option_cache_miss_build_s += elapsed_seconds(disk_started);
+    }
+    // Optional catalogue setup timing includes a backing-store restoration.
+    if (statistics != nullptr) statistics->setup_s += elapsed_seconds(disk_started);
+    return restored;
+  }
+  if (catalog_disk_cache_.enabled && (timing != nullptr || statistics != nullptr)) {
+    const double seconds = elapsed_seconds(disk_started);
+    if (timing != nullptr) timing->path_option_cache_miss_build_s += seconds;
+    if (statistics != nullptr) statistics->setup_s += seconds;
+  }
+  // Allocation failures used to report only bad_alloc.  Trace the failing
+  // catalog phase without temporary path/string buffers or success logs.
+  struct PathBuildTrace {
+    int origin;
+    int target;
+    int exceptions = std::uncaught_exceptions();
+    const char* phase = "setup";
+    std::uint64_t generated = 0;
+    std::size_t retained = 0;
+    PathCatalogStatistics* statistics;
+    double PathCatalogStatistics::* phase_seconds =
+        &PathCatalogStatistics::setup_s;
+    std::chrono::steady_clock::time_point phase_started;
+    PathBuildTrace(int origin_id, int target_id,
+                   PathCatalogStatistics* profile)
+        : origin(origin_id), target(target_id), statistics(profile),
+          phase_started(profile != nullptr
+              ? std::chrono::steady_clock::now()
+              : std::chrono::steady_clock::time_point{}) {}
+    void finish_phase() noexcept {
+      if (statistics != nullptr) {
+        const auto now = std::chrono::steady_clock::now();
+        (statistics->*phase_seconds) +=
+            std::chrono::duration<double>(now - phase_started).count();
+        phase_started = now;
+      }
+    }
+    void enter(const char* next,
+               double PathCatalogStatistics::* seconds) noexcept {
+      finish_phase();
+      phase = next;
+      phase_seconds = seconds;
+    }
+    ~PathBuildTrace() noexcept {
+      finish_phase();
+      if (std::uncaught_exceptions() > exceptions) {
+        std::fprintf(stderr,
+            "path_catalog_build_failure origin=%d target=%d phase=%s "
+            "generated=%llu retained=%zu\n",
+            origin, target, phase,
+            static_cast<unsigned long long>(generated), retained);
+      }
+    }
+  } trace{origin_id, target_id, statistics};
   if (option_keys_built_.insert(key).second) {
     ++option_first_builds_;
   } else {
     ++option_rebuilds_;
   }
   const auto build_started = std::chrono::steady_clock::now();
+  // Only the construction sequence representation changes. The live DFS path
+  // and every prefix-distance operation remain the original ones. A single
+  // build uses one pointer alternative, so CandidatePath remains 32 bytes.
+  struct PackedStationPath {
+    double distance{};
+    std::uint64_t stations{};
+    std::size_t fastest_curve_rank{};
+    std::size_t slowest_curve_rank{};
+  };
+  const bool packed_construction = complete_paths_ &&
+      packed_construction_enabled_ && packed_catalogs_enabled_ &&
+      instance_.station_ids().size() <= PathCatalog::DecodeBuffer{}.size();
   struct CandidatePath {
-    const StationPath* station_path{};
+    union {
+      const StationPath* station_path{};
+      const PackedStationPath* packed_station_path;
+    };
     double first_leg{};
     double last_leg{};
     double total_distance{};
   };
-  std::vector<CandidatePath> candidates;
-  const auto& reachable_first =
-      stations_reachable_from_anchor_.at(origin_id);
-  const auto& reachable_last = stations_reaching_anchor_.at(target_id);
-  candidates.reserve(reachable_first.size() * reachable_last.size());
-  for (const ReachableStation& first : reachable_first) {
-    for (const ReachableStation& last : reachable_last) {
-      for (const StationPath& station_path :
-           shortest_station_paths_[first.station_index][last.station_index]) {
-        candidates.push_back(CandidatePath{
-            .station_path = &station_path,
-            .first_leg = first.distance_km,
-            .last_leg = last.distance_km,
-            .total_distance = first.distance_km + station_path.distance +
-                              last.distance_km});
-      }
-    }
-  }
-  option_candidates_generated_ += candidates.size();
-  if (timing != nullptr) {
-    timing->path_option_candidates_generated += candidates.size();
-  }
-
-  std::sort(candidates.begin(), candidates.end(), [](const CandidatePath& left,
-                                                      const CandidatePath& right) {
-    return std::tie(left.first_leg, left.last_leg, left.total_distance,
-                    left.station_path->fastest_curve_rank,
-                    left.station_path->slowest_curve_rank,
-                    left.station_path->stations) <
-           std::tie(right.first_leg, right.last_leg, right.total_distance,
-                    right.station_path->fastest_curve_rank,
-                    right.station_path->slowest_curve_rank,
-                    right.station_path->stations);
-  });
-  const auto dominates = [](const CandidatePath& left,
+  static_assert(sizeof(CandidatePath) == 32);
+  const auto fastest_rank = [&](const CandidatePath& candidate) {
+    return packed_construction ? candidate.packed_station_path->fastest_curve_rank
+                               : candidate.station_path->fastest_curve_rank;
+  };
+  const auto slowest_rank = [&](const CandidatePath& candidate) {
+    return packed_construction ? candidate.packed_station_path->slowest_curve_rank
+                               : candidate.station_path->slowest_curve_rank;
+  };
+  const auto sequence_less = [&](const CandidatePath& left,
+                                 const CandidatePath& right) {
+    return packed_construction
+        ? left.packed_station_path->stations < right.packed_station_path->stations
+        : left.station_path->stations < right.station_path->stations;
+  };
+  const auto dominates = [&](const CandidatePath& left,
                             const CandidatePath& right) {
-    // TRC Section 4.3 requires even the slowest curve on the dominating
-    // path to be no slower than the fastest curve on the dominated path.
-    return left.station_path->slowest_curve_rank <=
-               right.station_path->fastest_curve_rank &&
+    return slowest_rank(left) <= fastest_rank(right) &&
            left.first_leg <= right.first_leg + kCostTolerance &&
            left.last_leg <= right.last_leg + kCostTolerance &&
            left.total_distance <= right.total_distance + kCostTolerance;
   };
+  std::vector<CandidatePath> candidates;
+  // Owners may move during enumeration: no CandidatePath pointing into a
+  // bucket escapes a predicate until the whole DFS has finished. The later
+  // candidate views are created only after all owner mutations have stopped.
+  struct StoredStationPath {
+    using Path = StationPath;
+    StationPath station_path;
+    double first_leg{};
+    double last_leg{};
+  };
+  struct PackedStoredStationPath {
+    using Path = PackedStationPath;
+    PackedStationPath station_path;
+    double first_leg{};
+    double last_leg{};
+  };
+  static_assert(sizeof(PackedStoredStationPath) == 48);
+  static_assert(std::is_nothrow_move_constructible_v<StoredStationPath> &&
+                std::is_nothrow_move_assignable_v<StoredStationPath> &&
+                std::is_nothrow_move_constructible_v<PackedStoredStationPath> &&
+                std::is_nothrow_move_assignable_v<PackedStoredStationPath>);
+  const auto described = []<typename Stored>(const Stored& stored) {
+    // Preserve first + (prefix - first) + last exactly; no shared middle sum.
+    CandidatePath result;
+    if constexpr (std::is_same_v<Stored, PackedStoredStationPath>) {
+      result.packed_station_path = &stored.station_path;
+    } else {
+      result.station_path = &stored.station_path;
+    }
+    result.first_leg = stored.first_leg;
+    result.last_leg = stored.last_leg;
+    result.total_distance = stored.first_leg + stored.station_path.distance +
+                            stored.last_leg;
+    return result;
+  };
+  const std::size_t curve_types = curve_rank_by_type_.size();
+  const auto& stations = instance_.station_ids();
+  // Within a first-station group the original stored first_leg is identical.
+  // Check that mandatory dominance predicate once before traversing its paths;
+  // retain bucket order, distance arithmetic and the original dominance test.
+  const std::size_t first_groups = stations.size();
+  // Contiguous owners avoid per-path list nodes and pointer chasing in the
+  // hot dominance scans. erase_if keeps survivor order; StationPath's vector
+  // moves transfer its buffer rather than copying stations during compaction.
+  const std::size_t bucket_count = curve_types * curve_types * first_groups;
+  std::vector<std::vector<StoredStationPath>> complete_storage(
+      !packed_construction ? bucket_count : 0);
+  std::vector<std::vector<PackedStoredStationPath>> packed_complete_storage(
+      packed_construction ? bucket_count : 0);
+  std::uint64_t& generated_count = trace.generated;
+  const auto& reachable_first =
+      stations_reachable_from_anchor_.at(origin_id);
+  const auto& reachable_last = stations_reaching_anchor_.at(target_id);
+  candidates.reserve(reachable_first.size() * reachable_last.size());
+  if (complete_paths_) {
+    trace.enter("elementary_enumeration", &PathCatalogStatistics::enumeration_s);
+    std::vector<bool> used(stations.size(), false);
+    std::vector<int> path;
+    std::vector<double> first_distances;
+    first_distances.reserve(first_groups);
+    for (const int station : stations) {
+      first_distances.push_back(instance_.distance_km(origin_id, station));
+    }
+    const double maximum_rate = maximum_charging_rate_wh_per_h_;
+    const double capacity = instance_.vehicle().battery_capacity_wh;
+    const double consumption = instance_.vehicle().consumption_wh_per_km;
+    const double horizon = instance_.vehicle().max_route_duration_h;
+    const double minimum_rest_distance =
+        instance_.distance_km(instance_.depot().id, origin_id) +
+        instance_.distance_km(target_id, instance_.depot().id);
+    const double minimum_service = instance_.node(origin_id).service_time_h +
+        (origin_id == target_id ? 0.0 : instance_.node(target_id).service_time_h);
+    const auto time_lower_bound = [&](double distance) {
+      // Any complete depot route containing this path also has to reach its
+      // origin and return from its target.  Triangle inequality lower-bounds
+      // those portions even when other customers/stations occur there.
+      distance += minimum_rest_distance;
+      return minimum_service + distance / instance_.vehicle().speed_kmph +
+             std::max(0.0, distance * consumption - capacity) / maximum_rate;
+    };
+    const auto build_complete = [&]<typename Stored>(
+        std::vector<std::vector<Stored>>& storage) {
+      constexpr bool packed = std::is_same_v<Stored, PackedStoredStationPath>;
+      const auto complete_bucket = [&](std::size_t fast, std::size_t slow,
+                                       std::size_t first) -> auto& {
+        return storage[(fast * curve_types + slow) * first_groups + first];
+      };
+      const auto enumerate = [&](auto&& self, int previous,
+                                  double prefix_distance, double first_leg,
+                                  std::size_t fastest, std::size_t slowest,
+                                  std::size_t first_index,
+                                  std::uint64_t encoded_prefix
+#if ILS_SP_PACKED_DFS_MASK
+                                  , std::uint32_t remaining_stations
+#endif
+                                  ) -> void {
+#if ILS_SP_PACKED_DFS_MASK
+        std::uint32_t choices = remaining_stations;
+#endif
+        for (std::size_t cursor = 0; cursor < stations.size();) {
+          std::size_t index;
+#if ILS_SP_PACKED_DFS_MASK
+          if constexpr (packed) {
+            if (choices == 0) break;
+            index = take_lowest_station_index(choices);
+          } else
+#endif
+          {
+            index = cursor++;
+            if (used[index]) continue;
+          }
+          const int station = stations[index];
+          const double leg = instance_.distance_km(previous, station);
+          if (leg * consumption > capacity + kEnergyToleranceWh) continue;
+          const double distance = prefix_distance + leg;
+          const double last_leg = instance_.distance_km(station, target_id);
+          // Triangle inequality and globally fastest charging give a lower
+          // bound for every continuation.  No feasible route of length Tmax
+          // can contain a path failing this bound; no hop/Top-K cap is used.
+          if (time_lower_bound(distance + last_leg) > horizon + kTimeToleranceH)
+            continue;
+          const double first = path.empty() ? leg : first_leg;
+          const std::size_t next_first_index = path.empty() ? index : first_index;
+          const std::size_t rank = station_curve_ranks_[index];
+          const std::size_t next_fastest = path.empty() ? rank : std::min(fastest, rank);
+          const std::size_t next_slowest = path.empty() ? rank : std::max(slowest, rank);
+          used[index] = true;
+          path.push_back(station);
+          std::uint64_t encoded_path = 0;
+          if constexpr (packed) {
+            // sorted station IDs map to nonzero nibbles, most significant first;
+            // depth <= alphabet <= 15 leaves the low nibble as a zero sentinel.
+            encoded_path = encoded_prefix |
+                (static_cast<std::uint64_t>(index + 1) << (64 - 4 * path.size()));
+          }
+          if (last_leg * consumption <= capacity + kEnergyToleranceWh) {
+            typename Stored::Path proposed;
+            proposed.distance = distance - first;
+            if constexpr (packed) proposed.stations = encoded_path;
+            else proposed.stations = path;
+            proposed.fastest_curve_rank = next_fastest;
+            proposed.slowest_curve_rank = next_slowest;
+            CandidatePath proposal;
+            if constexpr (packed) proposal.packed_station_path = &proposed;
+            else proposal.station_path = &proposed;
+            proposal.first_leg = first;
+            proposal.last_leg = last_leg;
+            proposal.total_distance = distance + last_leg;
+            ++generated_count;
+            bool rejected = false;
+            for (std::size_t slow = 0; slow <= next_fastest && !rejected; ++slow) {
+              for (std::size_t fast = 0; fast <= slow && !rejected; ++fast) {
+                for (std::size_t group_first = 0;
+                     group_first < first_groups && !rejected; ++group_first) {
+                  if (!(first_distances[group_first] <=
+                        proposal.first_leg + kCostTolerance)) continue;
+                  for (const Stored& stored :
+                       complete_bucket(fast, slow, group_first)) {
+                    const CandidatePath known = described(stored);
+                    if (dominates(known, proposal) &&
+                        (!dominates(proposal, known) ||
+                         sequence_less(known, proposal))) {
+                      rejected = true;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            if (!rejected) {
+              for (std::size_t fast = next_slowest; fast < curve_types; ++fast) {
+                for (std::size_t slow = fast; slow < curve_types; ++slow) {
+                  for (std::size_t group_first = 0; group_first < first_groups;
+                       ++group_first) {
+                    if (!(proposal.first_leg <=
+                          first_distances[group_first] + kCostTolerance)) continue;
+                    auto& bucket = complete_bucket(fast, slow, group_first);
+                    trace.retained -= std::erase_if(bucket, [&](const Stored& stored) {
+                      return dominates(proposal, described(stored));
+                    });
+                  }
+                }
+              }
+              const double stored_first = instance_.distance_km(
+                  origin_id, path.front());
+              const double stored_last = instance_.distance_km(
+                  path.back(), target_id);
+              complete_bucket(next_fastest, next_slowest, next_first_index).push_back(
+                  Stored{std::move(proposed), stored_first, stored_last});
+              ++trace.retained;
+            }
+          }
+          self(self, station, distance, first, next_fastest, next_slowest,
+               next_first_index, encoded_path
+#if ILS_SP_PACKED_DFS_MASK
+               , [&] {
+                   if constexpr (packed) {
+                     return remaining_stations & ~(std::uint32_t{1} << index);
+                   } else {
+                     return std::uint32_t{0};
+                   }
+                 }()
+#endif
+               );
+          path.pop_back();
+          used[index] = false;
+        }
+      };
+      enumerate(enumerate, origin_id, 0.0, 0.0, 0, 0, 0, 0
+#if ILS_SP_PACKED_DFS_MASK
+                , [&] {
+                    if constexpr (packed) {
+                      // Packed construction is selected only for <=15 stations.
+                      return (std::uint32_t{1} << stations.size()) - 1;
+                    } else {
+                      return std::uint32_t{0};
+                    }
+                  }()
+#endif
+                );
+      trace.enter("candidate_views", &PathCatalogStatistics::candidate_views_s);
+      for (const auto& bucket : storage) {
+        for (const Stored& retained : bucket) {
+          candidates.push_back(described(retained));
+        }
+      }
+    };
+    if (packed_construction) build_complete(packed_complete_storage);
+    else build_complete(complete_storage);
+  } else {
+    trace.enter("compressed_projection", &PathCatalogStatistics::enumeration_s);
+    for (const ReachableStation& first : reachable_first) {
+      for (const ReachableStation& last : reachable_last) {
+        for (const StationPath& station_path :
+             shortest_station_paths_[first.station_index][last.station_index]) {
+          candidates.push_back(CandidatePath{
+              .station_path = &station_path,
+              .first_leg = first.distance_km,
+              .last_leg = last.distance_km,
+              .total_distance = first.distance_km + station_path.distance +
+                                last.distance_km});
+        }
+      }
+    }
+  }
+  if (!complete_paths_) generated_count = candidates.size();
+  option_candidates_generated_ += generated_count;
+  if (timing != nullptr) {
+    timing->path_option_candidates_generated += generated_count;
+  }
+
+  trace.enter("candidate_sort", &PathCatalogStatistics::candidate_sort_s);
+  std::sort(candidates.begin(), candidates.end(), [&](const CandidatePath& left,
+                                                       const CandidatePath& right) {
+    const auto left_key = std::tuple{left.first_leg, left.last_leg,
+        left.total_distance, fastest_rank(left), slowest_rank(left)};
+    const auto right_key = std::tuple{right.first_leg, right.last_leg,
+        right.total_distance, fastest_rank(right), slowest_rank(right)};
+    if (left_key != right_key) return left_key < right_key;
+    return sequence_less(left, right);
+  });
   struct RankedCandidate {
     CandidatePath candidate;
     bool active{true};
   };
   const std::size_t curve_count = curve_rank_by_type_.size();
+  trace.enter("dominance_filter", &PathCatalogStatistics::dominance_filter_s);
   std::vector<RankedCandidate> ranked;
   ranked.reserve(candidates.size());
   std::vector<std::vector<std::size_t>> by_fastest(curve_count);
@@ -1641,7 +2381,7 @@ std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
   for (CandidatePath& candidate : candidates) {
     bool is_dominated = false;
     for (std::size_t slowest = 0;
-         slowest <= candidate.station_path->fastest_curve_rank;
+         slowest <= fastest_rank(candidate);
          ++slowest) {
       for (const std::size_t index : by_slowest[slowest]) {
         if (ranked[index].active &&
@@ -1655,9 +2395,22 @@ std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
     if (is_dominated) {
       continue;
     }
-    for (std::size_t fastest = candidate.station_path->slowest_curve_rank;
+    for (std::size_t fastest = slowest_rank(candidate);
          fastest < curve_count; ++fastest) {
-      for (const std::size_t index : by_fastest[fastest]) {
+      const auto& indexes = by_fastest[fastest];
+      // candidates were sorted by first_leg before these append-only indexes
+      // were built. Inactive entries retain the same distance and position.
+      // Every entry before this suffix fails the original first-leg predicate;
+      // use that predicate verbatim, not a rounded first_leg - tolerance key.
+      const auto first = catalog_first_leg_index_enabled_
+          ? std::partition_point(indexes.begin(), indexes.end(),
+                [&](std::size_t index) {
+                  return !(candidate.first_leg <=
+                      ranked[index].candidate.first_leg + kCostTolerance);
+                })
+          : indexes.begin();
+      for (auto position = first; position != indexes.end(); ++position) {
+        const std::size_t index = *position;
         if (ranked[index].active &&
             dominates(candidate, ranked[index].candidate)) {
           ranked[index].active = false;
@@ -1665,8 +2418,8 @@ std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
       }
     }
     const std::size_t index = ranked.size();
-    const std::size_t fastest = candidate.station_path->fastest_curve_rank;
-    const std::size_t slowest = candidate.station_path->slowest_curve_rank;
+    const std::size_t fastest = fastest_rank(candidate);
+    const std::size_t slowest = slowest_rank(candidate);
     ranked.push_back(
         RankedCandidate{.candidate = std::move(candidate), .active = true});
     by_fastest[fastest].push_back(index);
@@ -1684,48 +2437,166 @@ std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
     timing->path_option_nondominated += nondominated.size();
   }
 
-  auto result = std::make_shared<PathOptions>();
-  result->reserve(nondominated.size() + 1);
-  NonlinearSequenceEvaluator sequence_evaluator(instance_);
-  result->push_back(PathOption{
-      .stations = {},
-      .total_distance_km = instance_.distance_km(origin_id, target_id),
-      .label = sequence_evaluator.edge_label(origin_id, {}, target_id)});
-  for (const CandidatePath& candidate : nondominated) {
-    std::vector<int> path_stations = candidate.station_path->stations;
-    ChargingSequenceLabel label = sequence_evaluator.edge_label(
-        origin_id, path_stations, target_id);
-    result->push_back(PathOption{
-        .stations = std::move(path_stations),
-        .total_distance_km = candidate.total_distance,
-        .label = std::move(label)});
+  // Surviving views refer to complete_storage or shortest_station_paths_,
+  // not these consumed sorting/ranking buffers.  Release their allocations
+  // before constructing the additional station vectors and charging labels.
+  trace.enter("workspace_release", &PathCatalogStatistics::workspace_release_s);
+  std::vector<CandidatePath>().swap(candidates);
+  std::vector<RankedCandidate>().swap(ranked);
+  std::vector<std::vector<std::size_t>>().swap(by_fastest);
+  std::vector<std::vector<std::size_t>>().swap(by_slowest);
+
+  trace.enter("descriptor_materialization",
+              &PathCatalogStatistics::descriptor_materialization_s);
+  auto result = std::make_shared<PathCatalog>();
+  result->packed = packed_catalogs_enabled_ &&
+      instance_.station_ids().size() <= result->packed_station_ids.size();
+  if (result->packed) {
+    result->packed_station_count =
+        static_cast<std::uint8_t>(instance_.station_ids().size());
+    std::copy(instance_.station_ids().begin(), instance_.station_ids().end(),
+              result->packed_station_ids.begin());
   }
-  std::sort(result->begin(), result->end(),
-            [](const PathOption& left, const PathOption& right) {
-              return std::tuple{left.total_distance_km,
-                                left.stations.size(), left.stations} <
-                     std::tuple{right.total_distance_km,
-                                right.stations.size(), right.stations};
+  const auto maximum_offset = std::numeric_limits<std::uint32_t>::max();
+  if (nondominated.size() >= maximum_offset) {
+    throw std::length_error("station catalog descriptor index overflow");
+  }
+  std::size_t station_count = 0;
+  for (const CandidatePath& candidate : nondominated) {
+    const auto size = packed_construction
+        ? result->path_size(PathDescriptor{candidate.packed_station_path->stations, 0.0})
+        : candidate.station_path->stations.size();
+    if (size > maximum_offset - station_count) {
+      throw std::length_error("station catalog flat offset overflow");
+    }
+    station_count += size;
+  }
+  result->paths.reserve(nondominated.size() + 1);
+  if (!result->packed) result->station_ids.reserve(station_count);
+  result->paths.push_back(PathDescriptor{
+      .station_storage = 0,
+      .total_distance_km = instance_.distance_km(origin_id, target_id)});
+  for (const CandidatePath& candidate : nondominated) {
+    if (packed_construction) {
+      result->paths.push_back(PathDescriptor{
+          .station_storage = candidate.packed_station_path->stations,
+          .total_distance_km = candidate.total_distance});
+    } else {
+      const auto& stations = candidate.station_path->stations;
+      result->paths.push_back(PathDescriptor{
+          .station_storage = result->encode_path(
+              stations, static_cast<std::uint32_t>(result->station_ids.size())),
+          .total_distance_km = candidate.total_distance,
+      });
+      if (!result->packed) {
+        result->station_ids.insert(result->station_ids.end(), stations.begin(),
+                                   stations.end());
+      }
+    }
+  }
+  trace.enter("option_sort", &PathCatalogStatistics::option_sort_s);
+  std::sort(result->paths.begin(), result->paths.end(),
+            [&](const PathDescriptor& left, const PathDescriptor& right) {
+              const auto left_key =
+                  std::pair{left.total_distance_km, result->path_size(left)};
+              const auto right_key =
+                  std::pair{right.total_distance_km, result->path_size(right)};
+              if (left_key != right_key) return left_key < right_key;
+              return result->lexically_less(left, right);
             });
-  const std::size_t evictions_before = option_cache_.evictions();
-  option_cache_.put(key, result);
+  result->lexical_order.resize(result->paths.size());
+  for (std::size_t index = 0; index < result->paths.size(); ++index) {
+    result->lexical_order[index] = static_cast<std::uint32_t>(index);
+  }
+  std::sort(result->lexical_order.begin(), result->lexical_order.end(),
+            [&](std::uint32_t left, std::uint32_t right) {
+              return result->lexically_less(result->paths[left],
+                                             result->paths[right]);
+            });
+  const std::size_t evictions_before = catalog_cache_.evictions();
+  trace.enter("cache_admission", &PathCatalogStatistics::cache_admission_s);
+  disk_cache_store(key, *result);
+  const std::size_t bytes = result->retained_bytes();
+  if (bytes <= catalog_cache_budget_) {
+    while (catalog_cache_.size() != 0 &&
+           catalog_cache_bytes_ + bytes > catalog_cache_budget_) {
+      const auto evicted = catalog_cache_.discard_oldest();
+      catalog_cache_bytes_ -= (*evicted)->retained_bytes();
+    }
+    catalog_cache_.put(key, result);
+    catalog_cache_bytes_ += bytes;
+  }
   if (timing != nullptr) {
     timing->path_option_cache_evictions +=
-        option_cache_.evictions() - evictions_before;
+        catalog_cache_.evictions() - evictions_before;
     timing->path_option_cache_miss_build_s += elapsed_seconds(build_started);
   }
+  trace.enter("cleanup", &PathCatalogStatistics::cleanup_s);
   return result;
 }
 
-std::vector<std::vector<int>> PathSampler::paths_between(int origin_id,
-                                                         int target_id) {
-  const auto options = path_options(origin_id, target_id);
-  std::vector<std::vector<int>> paths;
-  paths.reserve(options->size());
-  for (const PathOption& option : *options) {
-    paths.push_back(option.stations);
+std::shared_ptr<const PathSampler::PathOptions> PathSampler::path_options(
+    int origin_id, int target_id, RepairTimingStatistics* timing,
+    PathCatalogStatistics* statistics) {
+  const auto catalog = path_catalog(origin_id, target_id, timing, statistics);
+  const AnchorPair key{origin_id, target_id};
+  if (auto cached = option_cache_.get(key); cached.has_value()) return *cached;
+  const auto started = std::chrono::steady_clock::now();
+  auto options = std::make_shared<PathOptions>();
+  options->reserve(catalog->size());
+  NonlinearSequenceEvaluator evaluator(instance_);
+  PathCatalog::DecodeBuffer decoded;
+  CatalogReader reader(*catalog);
+  for (std::size_t index = 0; index < catalog->size(); ++index) {
+    const PathDescriptor descriptor = reader.descriptor(index);
+    const auto path = catalog->stations(descriptor, decoded);
+    options->push_back(PathOption{
+        .stations = std::vector<int>(path.begin(), path.end()),
+        .total_distance_km = descriptor.total_distance_km,
+        .label = evaluator.edge_label(origin_id, path, target_id)});
   }
-  std::sort(paths.begin(), paths.end());
+  const auto retained_bytes = [](const PathOptions& values) {
+    std::size_t bytes = sizeof(PathOptions) + values.capacity() * sizeof(PathOption) + 256;
+    for (const PathOption& option : values) {
+      bytes += option.stations.capacity() * sizeof(int) +
+          option.label.station_legs.capacity() * sizeof(ChargingSequenceLeg) + 64;
+    }
+    return bytes;
+  };
+  constexpr std::size_t label_cache_budget = 128 * 1024 * 1024;
+  const std::size_t bytes = retained_bytes(*options);
+  if (bytes <= label_cache_budget) {
+    while (option_cache_.size() != 0 && option_cache_bytes_ + bytes > label_cache_budget) {
+      const auto evicted = option_cache_.discard_oldest();
+      option_cache_bytes_ -= retained_bytes(**evicted);
+    }
+    option_cache_.put(key, options);
+    option_cache_bytes_ += bytes;
+  }
+  const double elapsed = elapsed_seconds(started);
+  if (statistics != nullptr) statistics->label_materialization_s += elapsed;
+  if (timing != nullptr) timing->path_option_cache_miss_build_s += elapsed;
+  return options;
+}
+
+std::vector<std::vector<int>> PathSampler::paths_between(int origin_id,
+    int target_id, PathCatalogStatistics* statistics) {
+  const auto catalog = path_catalog(origin_id, target_id, nullptr, statistics);
+  const auto export_started = statistics != nullptr
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
+  std::vector<std::vector<int>> paths;
+  paths.reserve(catalog->size());
+  PathCatalog::DecodeBuffer decoded;
+  CatalogReader reader(*catalog);
+  for (std::size_t ordinal = 0; ordinal < catalog->size(); ++ordinal) {
+    const auto path = catalog->stations(
+        reader.descriptor(reader.lexical_index(ordinal)), decoded);
+    paths.emplace_back(path.begin(), path.end());
+  }
+  if (statistics != nullptr) {
+    statistics->export_s = elapsed_seconds(export_started);
+  }
   return paths;
 }
 
@@ -2003,11 +2874,117 @@ HintedPathResult PathSampler::apply_insertion_hints(
   return result;
 }
 
-std::optional<Solution> PathSampler::random_replacement(
+bool PathSampler::path_dominated(int origin, int target,
+                                 const std::vector<int>& path) const {
+  if (path.empty()) return false;  // Direct paths are never RP-dominated.
+  const auto& stations = instance_.station_ids();
+  const double first = instance_.distance_km(origin, path.front());
+  const double last = instance_.distance_km(path.back(), target);
+  double total = last;
+  int previous = origin;
+  std::size_t fastest = curve_rank_by_type_.size(), slowest = 0;
+  for (const int node : path) {
+    total += instance_.distance_km(previous, node);
+    const auto rank = curve_rank_by_type_.at(instance_.node(node).station_type);
+    fastest = std::min(fastest, rank);
+    slowest = std::max(slowest, rank);
+    previous = node;
+  }
+  const auto reference_key = std::tie(first, last, total, fastest, slowest, path);
+  std::vector<bool> used(stations.size(), false);
+  std::vector<int> witness;
+  const auto search = [&](auto&& self, int from, double distance,
+                           double witness_first, std::size_t best,
+                           std::size_t worst) -> bool {
+    for (std::size_t index = 0; index < stations.size(); ++index) {
+      if (used[index] || station_curve_ranks_[index] > fastest) continue;
+      const int next = stations[index];
+      const double leg = instance_.distance_km(from, next);
+      if (instance_.energy_wh(from, next) >
+          instance_.vehicle().battery_capacity_wh + kEnergyToleranceWh) continue;
+      const double leading = witness.empty() ? leg : witness_first;
+      if (leading > first + kCostTolerance) continue;
+      const double prefix = distance + leg;
+      const double trailing = instance_.distance_km(next, target);
+      if (prefix + trailing > total + kCostTolerance) continue;
+      const std::size_t next_best = witness.empty() ? station_curve_ranks_[index]
+                                                    : std::min(best, station_curve_ranks_[index]);
+      const std::size_t next_worst = witness.empty() ? station_curve_ranks_[index]
+                                                     : std::max(worst, station_curve_ranks_[index]);
+      used[index] = true;
+      witness.push_back(next);
+      const double witness_total = prefix + trailing;
+      if (trailing <= last + kCostTolerance &&
+          instance_.energy_wh(next, target) <=
+              instance_.vehicle().battery_capacity_wh + kEnergyToleranceWh &&
+          witness != path) {
+        const bool mutual = slowest <= next_best &&
+            first <= leading + kCostTolerance && last <= trailing + kCostTolerance &&
+            total <= witness_total + kCostTolerance;
+        if (!mutual || std::tie(leading, trailing, witness_total,
+                               next_best, next_worst, witness) < reference_key) return true;
+      }
+      if (self(self, next, prefix, leading, next_best, next_worst)) return true;
+      witness.pop_back();
+      used[index] = false;
+    }
+    return false;
+  };
+  return search(search, origin, 0.0, 0.0, 0, 0);
+}
+
+std::optional<std::vector<int>> PathSampler::sample_implicit_path(
+    int origin, int target, const std::vector<int>& current) {
+  const auto& stations = instance_.station_ids();
+  std::vector<bool> used(stations.size(), false);
+  std::vector<int> path;
+  int from = origin;
+  double distance = 0.0;
+  // Class A: geometric stopping, uniform feasible next station. Every finite
+  // elementary path has positive proposal probability; no hop/Top-K cap.
+  if (!current.empty() && std::bernoulli_distribution(0.5)(random_)) return path;
+  while (path.size() < stations.size()) {
+    std::vector<std::size_t> reachable;
+    for (std::size_t index = 0; index < stations.size(); ++index) {
+      if (!used[index] && instance_.energy_wh(from, stations[index]) <=
+          instance_.vehicle().battery_capacity_wh + kEnergyToleranceWh)
+        reachable.push_back(index);
+    }
+    if (reachable.empty()) return std::nullopt;
+    const std::size_t next = reachable[random_index(reachable, random_)];
+    distance += instance_.distance_km(from, stations[next]);
+    from = stations[next];
+    used[next] = true;
+    path.push_back(from);
+    const double tail = instance_.distance_km(from, target);
+    const double route_distance = instance_.distance_km(instance_.depot().id, origin) +
+        distance + tail + instance_.distance_km(target, instance_.depot().id);
+    const double lower_time = route_distance / instance_.vehicle().speed_kmph +
+        std::max(0.0, route_distance * instance_.vehicle().consumption_wh_per_km -
+                          instance_.vehicle().battery_capacity_wh) /
+            maximum_charging_rate_wh_per_h_ + instance_.node(origin).service_time_h +
+        (origin == target ? 0.0 : instance_.node(target).service_time_h);
+    if (lower_time > instance_.vehicle().max_route_duration_h + kTimeToleranceH)
+      return std::nullopt;
+    if (instance_.energy_wh(from, target) <=
+            instance_.vehicle().battery_capacity_wh + kEnergyToleranceWh &&
+        (path.size() == stations.size() || std::bernoulli_distribution(0.5)(random_))) {
+      if (path == current || path_dominated(origin, target, path)) return std::nullopt;
+      return path;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<PathSampler::RandomReplacementProposal>
+PathSampler::random_replacement_proposal(
     const Solution& solution) {
   std::size_t gap_count = 0;
   for (const Plan& plan : solution.plans) gap_count += plan.gaps.size();
   if (gap_count == 0) return std::nullopt;
+  std::optional<std::mt19937_64> before_catalogue_read;
+  if (catalog_disk_cache_.enabled && !implicit_replacement_)
+    before_catalogue_read.emplace(random_);
   std::size_t selected_ordinal =
       std::uniform_int_distribution<std::size_t>(0, gap_count - 1)(random_);
   std::size_t selected_route = 0;
@@ -2016,20 +2993,46 @@ std::optional<Solution> PathSampler::random_replacement(
     ++selected_route;
   }
   const std::size_t selected_gap = selected_ordinal;
-  Solution candidate = solution;
-  Plan& plan = candidate.plans[selected_route];
+  const Plan& plan = solution.plans[selected_route];
   std::vector<int> anchors;
   anchors.reserve(plan.customer_ids.size() + 2);
   anchors.push_back(instance_.depot().id);
   anchors.insert(anchors.end(), plan.customer_ids.begin(),
                  plan.customer_ids.end());
   anchors.push_back(instance_.depot().id);
-  auto options = alternatives(anchors[selected_gap], anchors[selected_gap + 1],
-                              plan.gaps[selected_gap]);
-  if (options.empty()) return std::nullopt;
   auto gaps = plan.gaps;
-  gaps[selected_gap] = options[random_index(options, random_)];
-  plan = factory_.make_plan(plan.customer_ids, std::move(gaps));
+  if (implicit_replacement_) {
+    auto sampled = sample_implicit_path(anchors[selected_gap],
+        anchors[selected_gap + 1], plan.gaps[selected_gap]);
+    if (!sampled.has_value()) return std::nullopt;
+    gaps[selected_gap] = std::move(*sampled);
+  } else {
+    std::optional<std::vector<int>> sampled;
+    try {
+      sampled = sample_explicit_path(anchors[selected_gap], anchors[selected_gap + 1],
+                                     plan.gaps[selected_gap]);
+    } catch (...) {
+      // A failed catalogue read must also roll back this operation's earlier
+      // gap-selection draw. Successful and null proposals retain the old RNG.
+      if (before_catalogue_read) random_ = *before_catalogue_read;
+      throw;
+    }
+    if (!sampled.has_value()) return std::nullopt;
+    gaps[selected_gap] = std::move(*sampled);
+  }
+  return RandomReplacementProposal{
+      .route_index = selected_route,
+      .plan = factory_.make_plan(plan.customer_ids, std::move(gaps))};
+}
+
+// Compatibility callers still receive a complete candidate. The proposal
+// owns only its changed Plan; no unchanged route is copied for a null draw.
+std::optional<Solution> PathSampler::random_replacement(
+    const Solution& solution) {
+  auto proposal = random_replacement_proposal(solution);
+  if (!proposal.has_value()) return std::nullopt;
+  Solution candidate = solution;
+  candidate.plans[proposal->route_index] = std::move(proposal->plan);
   return candidate;
 }
 
@@ -2278,7 +3281,9 @@ std::optional<Plan> PathSampler::best_replacement_in_gaps(
     PathCompletionStatistics* statistics) {
   if (plan.exact_charging || deadline_reached(deadline)) return std::nullopt;
   if (statistics != nullptr) ++statistics->search_passes;
-  const auto setup_started = std::chrono::steady_clock::now();
+  const auto setup_started = statistics != nullptr
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   std::vector<int> anchors;
   anchors.reserve(plan.customer_ids.size() + 2);
   anchors.push_back(instance_.depot().id);
@@ -2287,29 +3292,79 @@ std::optional<Plan> PathSampler::best_replacement_in_gaps(
   anchors.push_back(instance_.depot().id);
   NonlinearSequenceEvaluator sequence_evaluator(instance_);
   std::vector<ChargingSequenceLabel> edges;
-  edges.reserve(plan.gaps.size());
-  for (std::size_t gap_index = 0; gap_index < plan.gaps.size(); ++gap_index) {
-    if (deadline_reached(deadline)) return std::nullopt;
-    edges.push_back(sequence_evaluator.edge_label(
-        anchors[gap_index], plan.gaps[gap_index],
-        anchors[gap_index + 1]));
+  std::vector<ChargingSequenceLabel> prefixes;
+  std::vector<ChargingSequenceLabel> suffixes;
+  bool labels_prepared = false;
+  const auto prepare_labels = [&] {
+    if (labels_prepared) return true;
+    edges.reserve(plan.gaps.size());
+    for (std::size_t gap_index = 0; gap_index < plan.gaps.size(); ++gap_index) {
+      if (deadline_reached(deadline)) return false;
+      edges.push_back(sequence_evaluator.edge_label(
+          anchors[gap_index], plan.gaps[gap_index], anchors[gap_index + 1]));
+    }
+    for (const std::size_t gap : eligible_gaps) {
+      if (gap >= plan.gaps.size()) {
+        throw std::out_of_range("eligible path-repair gap is invalid");
+      }
+    }
+    prefixes.resize(plan.gaps.size() + 1);
+    for (std::size_t gap_index = 0; gap_index < plan.gaps.size(); ++gap_index) {
+      if (deadline_reached(deadline)) return false;
+      prefixes[gap_index + 1] = sequence_evaluator.concatenate(
+          prefixes[gap_index], edges[gap_index]);
+    }
+    suffixes.resize(plan.gaps.size() + 1);
+    for (std::size_t gap_index = plan.gaps.size(); gap_index-- > 0;) {
+      if (deadline_reached(deadline)) return false;
+      suffixes[gap_index] = sequence_evaluator.concatenate(
+          edges[gap_index], suffixes[gap_index + 1]);
+    }
+    labels_prepared = true;
+    return true;
+  };
+  // The full physical interior identifies customer/gap metadata only for a
+  // canonical plan. Partial customer partitions are valid here. Timed calls
+  // retain the original eager setup and every existing deadline check.
+  const bool bound_fp_supported = supported_bound_fp_environment();
+  if (!replacement_summary_statistics_.fp_fallback &&
+      replacement_summary_statistics_.bound_certified && !bound_fp_supported) {
+    // Preserve the permanent fallback after the certified FP environment
+    // changes; restoring the FP mode must not silently re-enable bounds.
+    replacement_summary_statistics_.fp_fallback = true;
   }
+  bool cacheable = !replacement_summary_statistics_.fp_fallback &&
+      !deadline.has_value() && statistics == nullptr &&
+      replacement_summary_budget_ != 0 &&
+      plan.route.visits.size() <= 256 &&
+      plan.gaps.size() == plan.customer_ids.size() + 1;
+  std::size_t visit = 0;
+  if (cacheable) {
+    const auto matches = [&](int id) {
+      return visit < plan.route.visits.size() && plan.route.visits[visit++] == id;
+    };
+    for (std::size_t gap = 0; gap < plan.gaps.size(); ++gap) {
+      for (int station : plan.gaps[gap]) {
+        if (instance_.node(station).kind != NodeKind::Station || !matches(station)) {
+          cacheable = false;
+        }
+      }
+      if (gap < plan.customer_ids.size()) {
+        const int customer = plan.customer_ids[gap];
+        if (instance_.node(customer).kind != NodeKind::Customer || !matches(customer) ||
+            std::find(plan.customer_ids.begin(), plan.customer_ids.begin() + gap,
+                      customer) != plan.customer_ids.begin() + gap) {
+          cacheable = false;
+        }
+      }
+    }
+    cacheable = cacheable && visit == plan.route.visits.size();
+  }
+  if (!prepare_labels()) return std::nullopt;
   for (const std::size_t gap_index : eligible_gaps) {
     if (gap_index >= plan.gaps.size()) {
       throw std::out_of_range("eligible path-repair gap is invalid");
     }
-  }
-  std::vector<ChargingSequenceLabel> prefixes(plan.gaps.size() + 1);
-  for (std::size_t gap_index = 0; gap_index < plan.gaps.size(); ++gap_index) {
-    if (deadline_reached(deadline)) return std::nullopt;
-    prefixes[gap_index + 1] = sequence_evaluator.concatenate(
-        prefixes[gap_index], edges[gap_index]);
-  }
-  std::vector<ChargingSequenceLabel> suffixes(plan.gaps.size() + 1);
-  for (std::size_t gap_index = plan.gaps.size(); gap_index-- > 0;) {
-    if (deadline_reached(deadline)) return std::nullopt;
-    suffixes[gap_index] = sequence_evaluator.concatenate(
-        edges[gap_index], suffixes[gap_index + 1]);
   }
   const double incumbent_cost =
       generalized_cost(*plan.evaluation, instance_, penalty_lambda);
@@ -2320,41 +3375,190 @@ std::optional<Plan> PathSampler::best_replacement_in_gaps(
   };
   double minimum_cost = std::numeric_limits<double>::infinity();
   std::vector<ReplacementCandidate> tolerance_band;
+  const bool bound_enabled = cacheable &&
+      replacement_summary_statistics_.bound_certified &&
+      bound_fp_supported;
+  const bool shortfall_bound_enabled = bound_enabled &&
+      shortfall_replacement_bound_enabled_ &&
+      NonlinearSequenceEvaluator::bounded_evaluation_compatible() &&
+      nonlinear_travel_bound(0.0, 0.0, 0, instance_.vehicle(), penalty_lambda).has_value();
+  // Already computed once for this immutable Instance. Under the certified
+  // data/FP scope its finite conservative upper rate excludes original Inf
+  // marginal rates; do not rescan curves for each physical candidate.
+  const bool all_charging_rates_finite =
+      std::isfinite(maximum_charging_rate_wh_per_h_);
   if (statistics != nullptr) {
     statistics->setup_s += elapsed_seconds(setup_started);
   }
   for (const std::size_t gap_index : eligible_gaps) {
     if (deadline_reached(deadline)) break;
-    const auto catalog_started = std::chrono::steady_clock::now();
-    const std::size_t cache_hits_before = option_cache_.hits();
-    const std::size_t cache_misses_before = option_cache_.misses();
-    const auto options =
-        path_options(anchors[gap_index], anchors[gap_index + 1]);
+    const auto catalog_started = statistics != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const std::size_t cache_hits_before = option_cache_hits();
+    const std::size_t cache_misses_before = option_cache_misses();
+    // Untimed completion builds option labels on demand from descriptors.
+    // Timed/profile requests retain eager option labels and deadline checks.
+    // Both scans use the same catalog descriptor order.
+    const bool scan_descriptors = !deadline.has_value() && statistics == nullptr;
+    const auto catalog = scan_descriptors
+        ? path_catalog(anchors[gap_index], anchors[gap_index + 1])
+        : std::shared_ptr<const PathCatalog>{};
+    const auto options = scan_descriptors
+        ? std::shared_ptr<const PathOptions>{}
+        : path_options(anchors[gap_index], anchors[gap_index + 1]);
+    std::optional<CatalogReader> reader;
+    if (catalog) reader.emplace(*catalog);
+    const std::size_t option_count = scan_descriptors
+        ? catalog->size() : options->size();
     if (statistics != nullptr) {
       statistics->option_catalog_s += elapsed_seconds(catalog_started);
       statistics->option_cache_hits +=
-          option_cache_.hits() - cache_hits_before;
+          option_cache_hits() - cache_hits_before;
       statistics->option_cache_misses +=
-          option_cache_.misses() - cache_misses_before;
+          option_cache_misses() - cache_misses_before;
     }
     if (deadline_reached(deadline)) break;
-    const auto scoring_started = std::chrono::steady_clock::now();
-    for (const PathOption& option : *options) {
+    const auto scoring_started = statistics != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    double option_service = 0.0;
+    if (bound_enabled) {
+      const auto& target = instance_.node(anchors[gap_index + 1]);
+      if (target.kind == NodeKind::Customer) option_service = target.service_time_h;
+    }
+    bool bulk_bound = bound_enabled && bulk_replacement_bound_enabled_;
+    std::size_t tail_station_upper = 0;
+    double tail_service = 0.0;
+    if (bulk_bound) {
+      if (!prepare_labels()) return std::nullopt;
+      const auto& prefix = prefixes[gap_index];
+      const auto& suffix = suffixes[gap_index + 1];
+      tail_station_upper = prefix.station_legs.size() +
+          instance_.station_ids().size() + suffix.station_legs.size();
+      bulk_bound = tail_station_upper <= 62;
+      tail_service = prefix.initialized
+          ? prefix.service_time_h + option_service : option_service;
+      if (suffix.initialized) tail_service += suffix.service_time_h;
+    }
+    for (std::size_t option_index = 0; option_index < option_count; ++option_index) {
+      const PathDescriptor descriptor = scan_descriptors
+          ? reader->descriptor(option_index) : PathDescriptor{};
+      if (bulk_bound) {
+        const auto& prefix = prefixes[gap_index];
+        const auto& suffix = suffixes[gap_index + 1];
+        const double option_travel = catalog_travel_lower_bound(
+            descriptor.total_distance_km,
+            instance_.vehicle().speed_kmph);
+        double travel = prefix.initialized
+            ? prefix.travel_time_h + option_travel : option_travel;
+        if (suffix.initialized) travel += suffix.travel_time_h;
+        auto lower = nonlinear_travel_bound(
+                travel, tail_service, tail_station_upper, instance_.vehicle(),
+                penalty_lambda);
+        if (lower && complete_paths_ && shortfall_bound_enabled && all_charging_rates_finite &&
+            zero_shift_energy_bound_enabled_) {
+          if (const auto energy_lower = zero_shift_energy_cost_bound(
+                  travel, tail_service, instance_.vehicle(), penalty_lambda))
+            *lower = std::max(*lower, *energy_lower);
+        }
+        if (lower) {
+          ++replacement_summary_statistics_.tail_checks;
+          if (*lower >= incumbent_cost - kCostTolerance ||
+              *lower > minimum_cost + kCostTolerance) {
+            // The cutoff is already certified. Count raw descriptors, including
+            // the cutoff descriptor and any current/excluded path occurrences.
+            // This intentionally differs from the former eligible-score metric:
+            // diagnostic accounting must not issue lexical catalogue queries.
+            replacement_summary_statistics_.raw_tail_descriptors_skipped +=
+                option_count - option_index;
+            break;
+          }
+        }
+      }
+      PathCatalog::DecodeBuffer decoded;
+      const std::span<const int> stations = scan_descriptors
+          ? catalog->stations(descriptor, decoded)
+          : std::span<const int>{(*options)[option_index].stations};
       if (deadline_reached(deadline)) break;
-      if (option.stations == plan.gaps[gap_index]) continue;
+      if (std::ranges::equal(stations, plan.gaps[gap_index])) continue;
       if (std::any_of(excluded.begin(), excluded.end(),
                       [&](const ExcludedPathOption& item) {
                         return item.gap == gap_index &&
-                               item.stations == option.stations;
+                               std::ranges::equal(item.stations, stations);
       })) {
         continue;
       }
       if (statistics != nullptr) ++statistics->options_scored;
+      RouteCostSummary summary;
+      if (!prepare_labels()) return std::nullopt;
+      bool candidate_shortfall_bound = false;
+      if (bound_enabled) {
+        const auto& prefix = prefixes[gap_index];
+        const auto& suffix = suffixes[gap_index + 1];
+        const std::size_t station_count = prefix.station_legs.size() +
+            stations.size() + suffix.station_legs.size();
+        if (station_count != 0 && station_count <= 62) {
+          double travel;
+          // Reproduce edge_label/append scalar arithmetic exactly. In
+          // particular, do not substitute total_distance / speed, add an
+          // empty prefix, or regroup the precomposed suffix.
+          double option_travel = 0.0;
+          int previous = anchors[gap_index];
+          for (const int station : stations) {
+            option_travel += instance_.travel_time_h(previous, station);
+            previous = station;
+          }
+          option_travel += instance_.travel_time_h(
+              previous, anchors[gap_index + 1]);
+          travel = prefix.initialized
+              ? prefix.travel_time_h + option_travel : option_travel;
+          if (suffix.initialized) travel += suffix.travel_time_h;
+          double service = prefix.initialized
+              ? prefix.service_time_h + option_service : option_service;
+          if (suffix.initialized) service += suffix.service_time_h;
+          // Canonical <=256 visits plus <=62 candidate CS and certified
+          // pair energy <=1e6 bound every energy segment well below 1e13.
+          // Original prefix/suffix validation and catalog CS identity remain.
+          if (const auto lower = nonlinear_travel_bound(
+                  travel, service, station_count, instance_.vehicle(),
+                  penalty_lambda)) {
+            candidate_shortfall_bound = shortfall_bound_enabled;
+            ++replacement_summary_statistics_.bound_checks;
+            if (*lower >= incumbent_cost - kCostTolerance ||
+                *lower > minimum_cost + kCostTolerance) {
+              ++replacement_summary_statistics_.bound_pruned;
+              continue;
+            }
+          }
+        }
+      }
       ChargingSequenceLabel candidate = prefixes[gap_index];
-      sequence_evaluator.append(candidate, option.label);
+      if (scan_descriptors) {
+        const ChargingSequenceLabel option_label = sequence_evaluator.edge_label(
+            anchors[gap_index], stations, anchors[gap_index + 1]);
+        ++replacement_summary_statistics_.labels_built;
+        sequence_evaluator.append(candidate, option_label);
+      } else {
+        sequence_evaluator.append(candidate, (*options)[option_index].label);
+      }
       sequence_evaluator.append(candidate, suffixes[gap_index + 1]);
-      const double candidate_cost =
-          sequence_evaluator.generalized_cost(candidate, penalty_lambda);
+      if (candidate_shortfall_bound) {
+        auto evaluated = sequence_evaluator.evaluate_bounded(
+            candidate, penalty_lambda, incumbent_cost - kCostTolerance,
+            minimum_cost + kCostTolerance, all_charging_rates_finite);
+        ++replacement_summary_statistics_.misses;
+        if (std::get_if<NonlinearCostLowerBound>(&evaluated) != nullptr) {
+          // A partial bound is not an exact score and must not enter ranking.
+          ++replacement_summary_statistics_.propagation_pruned;
+          continue;
+        }
+        summary = std::get<RouteCostSummary>(evaluated);
+      } else {
+        summary = sequence_evaluator.evaluate(candidate);
+        ++replacement_summary_statistics_.misses;
+      }
+      const double candidate_cost = generalized_cost(summary, instance_, penalty_lambda);
       if (candidate_cost >= incumbent_cost - kCostTolerance) continue;
       if (candidate_cost < minimum_cost) {
         minimum_cost = candidate_cost;
@@ -2366,7 +3570,7 @@ std::optional<Plan> PathSampler::best_replacement_in_gaps(
         tolerance_band.push_back(ReplacementCandidate{
             .cost = candidate_cost,
             .gap = gap_index,
-            .stations = option.stations});
+            .stations = std::vector<int>(stations.begin(), stations.end())});
       }
     }
     if (statistics != nullptr) {
@@ -2376,7 +3580,9 @@ std::optional<Plan> PathSampler::best_replacement_in_gaps(
   if (deadline_reached(deadline)) return std::nullopt;
   if (tolerance_band.empty()) return std::nullopt;
 
-  const auto materialization_started = std::chrono::steady_clock::now();
+  const auto materialization_started = statistics != nullptr
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   const ReplacementCandidate* best = nullptr;
   std::vector<int> best_visits;
   for (const ReplacementCandidate& candidate : tolerance_band) {
@@ -2415,7 +3621,9 @@ Plan PathSampler::improve_path_subset(
           plan, penalty_lambda, eligible_gaps, excluded, deadline,
           statistics);
       if (!improved.has_value()) return plan;
-      const auto acceptance_started = std::chrono::steady_clock::now();
+      const auto acceptance_started = statistics != nullptr
+          ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
       const double incumbent_cost =
           generalized_cost(*plan.evaluation, instance_, penalty_lambda);
       const double improved_cost =
@@ -2456,7 +3664,8 @@ Plan PathSampler::improve_path_subset(
 Plan PathSampler::repair_new_gaps(
     Plan plan, const PlanFactory::GapMap& inherited_gaps,
     double penalty_lambda,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    bool single_step) {
   if (plan.exact_charging || deadline_reached(deadline)) return plan;
   std::vector<int> anchors;
   anchors.reserve(plan.customer_ids.size() + 2);
@@ -2472,6 +3681,20 @@ Plan PathSampler::repair_new_gaps(
       introduced.push_back(gap);
     }
   }
+  if (single_step) {
+    if (introduced.empty()) return plan;
+    // Keep the original catalog, lazy labels, certified bounds and proposal
+    // tie ordering. No fixed-point iteration or full-rejection exclusion retry.
+    auto proposed = best_replacement_in_gaps(
+        plan, penalty_lambda, introduced, {}, deadline, nullptr);
+    if (proposed &&
+        generalized_cost(*proposed->evaluation, instance_, penalty_lambda) <
+            generalized_cost(*plan.evaluation, instance_, penalty_lambda) -
+                kCostTolerance) {
+      return std::move(*proposed);
+    }
+    return plan;
+  }
   return improve_path_subset(std::move(plan), penalty_lambda, introduced,
                              deadline, nullptr);
 }
@@ -2482,7 +3705,9 @@ Plan PathSampler::repair_affected_paths(
     std::optional<std::chrono::steady_clock::time_point> deadline,
     PathCompletionStatistics* statistics) {
   if (plan.exact_charging || deadline_reached(deadline)) return plan;
-  const auto total_started = std::chrono::steady_clock::now();
+  const auto total_started = statistics != nullptr
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   const auto eligibility_started = total_started;
   if (statistics != nullptr) ++statistics->calls;
   std::vector<int> anchors;
@@ -2523,22 +3748,29 @@ InitialSolutionBuilder::InitialSolutionBuilder(const Instance& instance,
                                                std::mt19937_64& random,
                                                SearchProfile profile,
                                                std::size_t promising_arc_count,
-                                               std::size_t granular_threshold)
+                                               std::size_t granular_threshold,
+                                               bool rebuild_station_paths,
+                                               bool preserve_station_visits)
     : instance_(instance),
       factory_(factory),
       path_sampler_(path_sampler),
       random_(random),
       profile_(profile),
+      rebuild_station_paths_(rebuild_station_paths),
+      preserve_station_visits_(preserve_station_visits),
       granular_(profile == SearchProfile::GranularAdaptive &&
                         instance.customer_ids().size() > granular_threshold
                     ? std::make_unique<GranularNeighborhood>(
                           instance, promising_arc_count)
-                    : nullptr),
-      maximum_charging_rate_wh_per_h_(
-          completes_insertion_candidates(profile) ||
-                  uses_granular_topology(profile)
-              ? maximum_charging_rate(instance)
-              : 0.0) {}
+                    : nullptr) {
+  if ((rebuild_station_paths_ || preserve_station_visits_) &&
+      profile_ != SearchProfile::LinkedInsertionCandidates) {
+    throw std::invalid_argument("station initialization requires candidate completion");
+  }
+  if (rebuild_station_paths_ && preserve_station_visits_) {
+    throw std::invalid_argument("rebuilt and physical initialization are exclusive");
+  }
+}
 
 Solution InitialSolutionBuilder::build(double penalty_lambda) {
   std::vector<int> unassigned = instance_.customer_ids();
@@ -2552,30 +3784,122 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
         std::move(first_plan), PlanFactory::GapMap{}, penalty_lambda);
   }
   Solution current{{std::move(first_plan)}};
+  if (preserve_station_visits_) {
+    // A singleton is completed only when its optimistic cost can still beat
+    // an existing placement. All candidates retain the same greedy total order;
+    // completions are local to this fixed-lambda build and consume no RNG.
+    std::unordered_map<int, Plan> singletons;
+    std::unordered_map<int, double> singleton_bounds;
+    NonlinearSequenceEvaluator direct_scorer(instance_);
+    for (const int customer : unassigned) {
+      singleton_bounds.emplace(customer, linked_route_lower_bound(
+          direct_scorer.evaluate(direct_scorer.route_label(Route{{customer}})),
+          instance_, penalty_lambda, &path_sampler_));
+    }
+    std::vector<std::unique_ptr<PhysicalRouteScorer>> scorers;
+    scorers.push_back(std::make_unique<PhysicalRouteScorer>(instance_, current.plans[0]));
+    ++statistics_.physical_route_profiles_built;
+    while (!unassigned.empty()) {
+      ++statistics_.physical_insertion_decisions;
+      std::optional<InsertionMove> best;
+      for (const int customer : unassigned) {
+        for (std::size_t route = 0; route < current.plans.size(); ++route) {
+          const double old_cost = generalized_cost(
+              *current.plans[route].evaluation, instance_, penalty_lambda);
+          const std::size_t slots = current.plans[route].route.visits.size() + 1;
+          for (std::size_t slot = 0; slot < slots; ++slot) {
+            const double cost = generalized_cost(
+                scorers[route]->evaluate_insertion(slot, customer), instance_, penalty_lambda);
+            InsertionMove move;
+            move.customer_id = customer;
+            move.route_index = route;
+            move.position = slot;
+            move.delta = cost - old_cost;
+            ++statistics_.physical_insertion_candidates;
+            if (!best || insertion_better(move, *best)) best = std::move(move);
+          }
+        }
+      }
+      for (const int customer : unassigned) {
+        // The certified travel/horizon relaxation permits two station paths
+        // and ignores energy penalties. Keep the
+        // existing numeric safety margin and evaluate every possible tie.
+        ++statistics_.physical_insertion_candidates;
+        if (singleton_bounds.at(customer) > best->delta + kLinkedBoundSafety) continue;
+        auto cached = singletons.find(customer);
+        if (cached == singletons.end()) {
+          cached = singletons.emplace(customer, path_sampler_.repair_new_gaps(
+              factory_.plan_sequence({customer}), {}, penalty_lambda)).first;
+        }
+        InsertionMove move;
+        move.customer_id = customer;
+        move.route_index = current.plans.size();
+        move.position = 0;
+        move.delta = generalized_cost(*cached->second.evaluation, instance_, penalty_lambda);
+        if (singleton_bounds.at(customer) > move.delta + kLinkedBoundSafety) {
+          throw std::logic_error("singleton lower bound exceeded completed cost");
+        }
+        if (insertion_better(move, *best)) best = std::move(move);
+      }
+      const std::size_t route = best->route_index;
+      const int customer = best->customer_id;
+      if (route == current.plans.size()) {
+        current.plans.push_back(singletons.at(customer));
+      } else {
+        auto visits = current.plans[route].route.visits;
+        visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(best->position), customer);
+        current.plans[route] = factory_.plan_visits(std::move(visits));
+      }
+      std::erase(unassigned, customer);
+      if (!unassigned.empty()) {
+        auto updated = std::make_unique<PhysicalRouteScorer>(instance_, current.plans[route]);
+        if (route == scorers.size()) scorers.push_back(std::move(updated));
+        else scorers[route] = std::move(updated);
+        ++statistics_.physical_route_profiles_built;
+      }
+    }
+    current.validate_partition(instance_);
+    return current;
+  }
   InsertionCompletionMemo completion_memo{
       kInsertionCompletionMemoCapacity};
   VirtualInsertionCompletionMemo virtual_completion_memo{
       kVirtualInsertionCompletionMemoCapacity};
   std::unique_ptr<RouteSequenceScorer> sequence_scorer;
   while (!unassigned.empty()) {
-    const PlanFactory::GapMap reference_gaps = factory_.gap_map(current);
+    const PlanFactory::GapMap reference_gaps = rebuild_station_paths_
+        ? PlanFactory::GapMap{} : factory_.gap_map(current);
+    Solution direct_source;
+    if (rebuild_station_paths_) {
+      direct_source.plans.reserve(current.plans.size());
+      for (const Plan& plan : current.plans) {
+        direct_source.plans.push_back(factory_.plan_sequence(plan.customer_ids));
+      }
+    }
+    // Rebuilt candidates may discard any old station detour. Their lower
+    // bounds must use direct slices too; an empty gap map alone is insufficient.
+    // insertion_moves still subtracts the actual incumbent route cost.
+    const Solution& scoring_source = rebuild_station_paths_ ? direct_source : current;
     if (sequence_scorer == nullptr) {
       sequence_scorer = std::make_unique<RouteSequenceScorer>(
-          instance_, current, reference_gaps);
+          instance_, scoring_source, reference_gaps);
     } else {
-      sequence_scorer->reset(current, reference_gaps);
+      sequence_scorer->reset(scoring_source, reference_gaps);
     }
     const RouteSequenceScorer& scorer = *sequence_scorer;
     std::optional<InsertionMove> best;
     const bool complete_all_candidates =
         completes_insertion_candidates(profile_);
+    // Rebuilt initialization may change every gap, outside the two-gap proof.
+    const PathSampler* linked_bound_sampler =
+        rebuild_station_paths_ ? nullptr : &path_sampler_;
     if (uses_granular_topology(profile_)) {
       std::vector<InsertionMove> candidates;
       std::vector<RejectedInsertionDescriptor> rejected;
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(
             current, customer_id, instance_, scorer, penalty_lambda, true,
-            maximum_charging_rate_wh_per_h_, false, granular_.get(),
+            linked_bound_sampler, false, granular_.get(),
             &statistics_.candidates_rejected_by_granular,
             granular_ != nullptr ? &rejected : nullptr);
         candidates.insert(candidates.end(),
@@ -2585,7 +3909,7 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
       if (granular_ != nullptr) {
         append_granular_escape(
             candidates, rejected, current, instance_, scorer,
-            penalty_lambda, maximum_charging_rate_wh_per_h_, random_,
+            penalty_lambda, linked_bound_sampler, random_,
             statistics_);
       }
       best = choose_lazy_path_greedy(
@@ -2596,7 +3920,7 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(
             current, customer_id, instance_, scorer, penalty_lambda,
-            true, maximum_charging_rate_wh_per_h_, false, granular_.get(),
+            true, linked_bound_sampler, false, granular_.get(),
             &statistics_.candidates_rejected_by_granular);
         candidates.insert(candidates.end(),
                           std::make_move_iterator(moves.begin()),
@@ -2609,7 +3933,7 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
       for (const int customer_id : unassigned) {
         for (InsertionMove move : insertion_moves(
                  current, customer_id, instance_, scorer, penalty_lambda,
-                 false, 0.0, false, granular_.get(),
+                 false, nullptr, false, granular_.get(),
                  &statistics_.candidates_rejected_by_granular)) {
           if (!best.has_value() || insertion_better(move, *best)) {
             best = std::move(move);
@@ -2618,9 +3942,8 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
       }
     }
     const int inserted = best->customer_id;
-    // An insertion changes customer order only.  The two gaps incident to the
-    // inserted customer are absent from the current partial solution and are
-    // therefore materialized as direct paths by plan_sequence().
+    // Materialize the scored completion. Without completion, changed gaps are
+    // direct; rebuilt construction starts every gap direct before completion.
     Plan selected =
         best->completion && !uses_granular_topology(profile_)
             ? best->completion->completed_plan
@@ -2642,23 +3965,26 @@ Perturbation::Perturbation(const Instance& instance, PlanFactory& factory,
                            std::mt19937_64& random,
                            SearchProfile profile,
                            std::size_t promising_arc_count,
-                           std::size_t granular_threshold)
+                           std::size_t granular_threshold,
+                           PartialRouteSubset partial_route_subset,
+                           bool preserve_station_visits)
     : instance_(instance),
       factory_(factory),
       path_sampler_(path_sampler),
       random_(random),
       profile_(profile),
+      partial_route_subset_(partial_route_subset),
+      preserve_station_visits_(preserve_station_visits),
       granular_(uses_granular_topology(profile) &&
                         instance.customer_ids().size() >
                             granular_threshold
                     ? std::make_unique<GranularNeighborhood>(
                           instance, promising_arc_count)
-                    : nullptr),
-      maximum_charging_rate_wh_per_h_(
-          completes_insertion_candidates(profile) ||
-                  uses_granular_topology(profile)
-              ? maximum_charging_rate(instance)
-              : 0.0) {}
+                    : nullptr) {
+  if (preserve_station_visits_ && profile_ != SearchProfile::Paper) {
+    throw std::invalid_argument("station-preserving LNS requires the paper VND profile");
+  }
+}
 
 DestroyedSolution Perturbation::destroy(const Solution& solution,
                                         DestroyOperator operation,
@@ -2666,8 +3992,39 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
                                         double penalty_lambda) {
   std::vector<int> customers = all_customers(solution);
   removal_count = std::min(removal_count, customers.size());
+  if (removal_count == 0) return DestroyedSolution{solution, {}};
   std::vector<int> removed;
   removed.reserve(removal_count);
+
+  // TRC 5.1.4 removes exactly kappa customers.  Route-oriented operators
+  // keep their route selection. Only their last oversize route has an
+  // explicit A subset choice; Closest keeps its ordered correlation prefix.
+  const auto append_up_to_quota = [&](const std::vector<int>& route,
+                                     bool route_oriented = false) {
+    const std::size_t count =
+        std::min(route.size(), removal_count - removed.size());
+    if (count == 0) return;
+    if (route_oriented && count < route.size()) {
+      ++statistics_.partial_route_events;
+      if (partial_route_subset_ == PartialRouteSubset::Random) {
+        ++statistics_.randomized_partial_routes;
+        std::vector<std::size_t> positions(route.size());
+        std::iota(positions.begin(), positions.end(), 0);
+        // Partial Fisher-Yates chooses a uniform subset without replacement.
+        // Normalize its output order to avoid separately permuting repair input.
+        for (std::size_t index = 0; index < count; ++index) {
+          const std::size_t selected =
+              std::uniform_int_distribution<std::size_t>(index, route.size() - 1)(random_);
+          std::swap(positions[index], positions[selected]);
+        }
+        std::sort(positions.begin(), positions.begin() + static_cast<std::ptrdiff_t>(count));
+        for (std::size_t index = 0; index < count; ++index) removed.push_back(route[positions[index]]);
+        return;
+      }
+    }
+    removed.insert(removed.end(), route.begin(),
+                   route.begin() + static_cast<std::ptrdiff_t>(count));
+  };
 
   if (operation == DestroyOperator::RandomRemoval) {
     std::shuffle(customers.begin(), customers.end(), random_);
@@ -2679,18 +4036,18 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
     std::shuffle(route_order.begin(), route_order.end(), random_);
     for (const std::size_t route_index : route_order) {
       const auto& route_customers = solution.plans[route_index].customer_ids;
-      removed.insert(removed.end(), route_customers.begin(),
-                     route_customers.end());
+      append_up_to_quota(route_customers, true);
       if (removed.size() >= removal_count) break;
     }
   } else if (operation == DestroyOperator::ClosestRemoval) {
     const int seed = customers[random_index(customers, random_)];
+    removed.push_back(seed);
+    std::erase(customers, seed);
     std::sort(customers.begin(), customers.end(), [&](int left, int right) {
       return std::tuple{instance_.distance_km(seed, left), left} <
              std::tuple{instance_.distance_km(seed, right), right};
     });
-    removed.assign(customers.begin(), customers.begin() +
-                                          static_cast<std::ptrdiff_t>(removal_count));
+    append_up_to_quota(customers);
   } else {
     struct TargetContribution {
       double value{};
@@ -2698,41 +4055,59 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
       std::size_t route_index{};
     };
     std::vector<TargetContribution> contribution;
-    const auto reference_gaps = factory_.gap_map(solution);
-    if (sequence_scorer_ == nullptr) {
+    const auto reference_gaps = preserve_station_visits_
+        ? PlanFactory::GapMap{} : factory_.gap_map(solution);
+    if (!preserve_station_visits_ && sequence_scorer_ == nullptr) {
       sequence_scorer_ = std::make_unique<RouteSequenceScorer>(
           instance_, solution, reference_gaps);
-    } else {
+    } else if (!preserve_station_visits_) {
       sequence_scorer_->reset(solution, reference_gaps);
     }
-    const RouteSequenceScorer& scorer = *sequence_scorer_;
     for (std::size_t route_index = 0; route_index < solution.plans.size();
          ++route_index) {
       const Plan& plan = solution.plans[route_index];
       const double current_cost =
           generalized_cost(*plan.evaluation, instance_, penalty_lambda);
+      std::optional<PhysicalRouteScorer> physical_scorer;
+      if (preserve_station_visits_) physical_scorer.emplace(instance_, plan);
       for (const int customer_id : plan.customer_ids) {
-        std::vector<int> reduced = plan.customer_ids;
-        std::erase(reduced, customer_id);
-        const double reduced_cost =
-            reduced.empty()
-                ? 0.0
-                : sequence_cost(reduced, scorer, penalty_lambda);
+        double reduced_cost = 0.0;
+        if (plan.customer_ids.size() > 1 && physical_scorer.has_value()) {
+          const auto position = std::find(plan.route.visits.begin(),
+                                          plan.route.visits.end(), customer_id);
+          reduced_cost = generalized_cost(physical_scorer->evaluate_removal(
+              static_cast<std::size_t>(position - plan.route.visits.begin())),
+              instance_, penalty_lambda);
+        } else if (plan.customer_ids.size() > 1) {
+          auto reduced = plan.customer_ids;
+          std::erase(reduced, customer_id);
+          reduced_cost = sequence_cost(reduced, *sequence_scorer_, penalty_lambda);
+        }
         contribution.push_back(TargetContribution{
             .value = current_cost - reduced_cost,
             .customer_id = customer_id,
             .route_index = route_index});
       }
     }
-    std::sort(contribution.begin(), contribution.end(),
-              [](const auto& left, const auto& right) {
-                if (std::abs(left.value - right.value) > kCostTolerance)
-                  return left.value > right.value;
-                return std::tie(left.customer_id, left.route_index) <
-                       std::tie(right.customer_id, right.route_index);
-              });
-    const int target = contribution.front().customer_id;
-    const std::size_t target_route = contribution.front().route_index;
+    // Only the target is needed. Pairwise tolerance ties are not transitive
+    // and cannot be used as a std::sort comparator. Anchor the tie band to
+    // the actual maximum, then choose its smallest customer/route key.
+    const auto maximum = std::max_element(
+        contribution.begin(), contribution.end(),
+        [](const auto& left, const auto& right) {
+          return left.value < right.value;
+        });
+    auto selected = maximum;
+    for (auto candidate = contribution.begin(); candidate != contribution.end();
+         ++candidate) {
+      if (maximum->value - candidate->value <= kCostTolerance &&
+          std::tie(candidate->customer_id, candidate->route_index) <
+              std::tie(selected->customer_id, selected->route_index)) {
+        selected = candidate;
+      }
+    }
+    const int target = selected->customer_id;
+    const std::size_t target_route = selected->route_index;
     removed.push_back(target);
     struct RankedRoute {
       double distance_to_target{};
@@ -2757,22 +4132,47 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
              std::tie(right.distance_to_target, right.route_index);
     });
     for (const RankedRoute& candidate : ranked) {
+      if (removed.size() == removal_count) break;
       const auto& route_customers =
           solution.plans[candidate.route_index].customer_ids;
-      removed.insert(removed.end(), route_customers.begin(),
-                     route_customers.end());
-      if (removed.size() >= removal_count) break;
+      append_up_to_quota(route_customers, true);
     }
-    // A single-route solution has no other route to ruin.  In that boundary
-    // case, remove the remainder of the target route to satisfy the quota.
+    // The target route supplies any remaining quota after other routes.
     if (removed.size() < removal_count) {
+      std::vector<int> eligible;
       for (const int customer_id :
            solution.plans[target_route].customer_ids) {
-        if (customer_id != target) removed.push_back(customer_id);
+        if (customer_id != target) eligible.push_back(customer_id);
       }
+      append_up_to_quota(eligible, true);
     }
   }
 
+  if (preserve_station_visits_) {
+    const std::unordered_set<int> removed_set(removed.begin(), removed.end());
+    Solution remaining;
+    remaining.plans.reserve(solution.plans.size());
+    for (const Plan& plan : solution.plans) {
+      if (std::none_of(plan.customer_ids.begin(), plan.customer_ids.end(),
+                       [&](int id) { return removed_set.contains(id); })) {
+        remaining.plans.push_back(plan);
+        continue;
+      }
+      if (std::all_of(plan.customer_ids.begin(), plan.customer_ids.end(),
+                      [&](int id) { return removed_set.contains(id); })) {
+        continue;  // A route with no remaining customers is removed as a whole.
+      }
+      std::vector<int> visits;
+      visits.reserve(plan.route.visits.size());
+      for (const int id : plan.route.visits) {
+        if (!removed_set.contains(id)) visits.push_back(id);
+      }
+      // Keep every station occurrence, including those now sharing a gap.
+      remaining.plans.push_back(factory_.plan_visits(std::move(visits)));
+    }
+    return DestroyedSolution{.remaining = std::move(remaining),
+                             .removed_customers = std::move(removed)};
+  }
   auto sequences = remove_customers(solution, removed);
   Solution remaining =
       build_solution_from_sequences(sequences, factory_, &solution);
@@ -2784,6 +4184,10 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
                               RepairOperator operation,
                               double penalty_lambda,
                               std::vector<InsertionPathHint>* hints) {
+  if (preserve_station_visits_) {
+    return repair_preserving_stations(std::move(destroyed), operation,
+                                      penalty_lambda);
+  }
   Solution current = std::move(destroyed.remaining);
   std::vector<int> unassigned = std::move(destroyed.removed_customers);
   InsertionCompletionMemo completion_memo{
@@ -2811,7 +4215,7 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(
             current, customer_id, instance_, scorer, penalty_lambda, true,
-            maximum_charging_rate_wh_per_h_, false, granular_.get(),
+            &path_sampler_, false, granular_.get(),
             &statistics_.candidates_rejected_by_granular,
             granular_ != nullptr ? &rejected : nullptr);
         candidates.insert(candidates.end(),
@@ -2821,7 +4225,7 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
       if (granular_ != nullptr) {
         append_granular_escape(
             candidates, rejected, current, instance_, scorer,
-            penalty_lambda, maximum_charging_rate_wh_per_h_, random_,
+            penalty_lambda, &path_sampler_, random_,
             statistics_);
       }
       statistics_.repair_timing.granular_direct_scoring_s +=
@@ -2843,7 +4247,7 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(
             current, customer_id, instance_, scorer, penalty_lambda,
-            true, maximum_charging_rate_wh_per_h_, false, granular_.get(),
+            true, &path_sampler_, false, granular_.get(),
             &statistics_.candidates_rejected_by_granular);
         candidates.insert(candidates.end(),
                           std::make_move_iterator(moves.begin()),
@@ -2851,17 +4255,18 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
       }
       chosen = choose_linked_greedy(
           std::move(candidates), current, instance_, factory_, path_sampler_,
-          reference_gaps, penalty_lambda, statistics_, completion_memo);
+          reference_gaps, penalty_lambda, statistics_, completion_memo,
+          single_step_repair_completion_);
     } else if (completes_insertion_candidates(profile_)) {
       chosen = choose_linked_two_regret(
           current, unassigned, instance_, factory_, path_sampler_, scorer,
-          reference_gaps, penalty_lambda, maximum_charging_rate_wh_per_h_,
-          statistics_, completion_memo);
+          reference_gaps, penalty_lambda, &path_sampler_,
+          statistics_, completion_memo, single_step_repair_completion_);
     } else if (operation == RepairOperator::GreedyInsertion) {
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(
             current, customer_id, instance_, scorer, penalty_lambda,
-            false, 0.0, false,
+            false, nullptr, false,
             granular_.get(),
             &statistics_.candidates_rejected_by_granular);
         for (InsertionMove move : std::move(moves)) {
@@ -2874,16 +4279,15 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
       double best_regret = -1.0;
       for (const int customer_id : unassigned) {
         auto moves = insertion_moves(current, customer_id, instance_, scorer,
-                                     penalty_lambda, false, 0.0, false,
+                                     penalty_lambda, false, nullptr, false,
                                      granular_.get(),
                                      &statistics_.candidates_rejected_by_granular);
         std::sort(moves.begin(), moves.end(), insertion_better);
         const double regret = moves.size() == 1
                                   ? std::numeric_limits<double>::infinity()
                                   : moves[1].delta - moves[0].delta;
-        if (!chosen.has_value() || regret > best_regret + kCostTolerance ||
-            (std::abs(regret - best_regret) <= kCostTolerance &&
-             insertion_better(moves[0], *chosen))) {
+        if (!chosen.has_value() ||
+            regret_better(regret, moves[0], best_regret, *chosen)) {
           best_regret = regret;
           chosen = std::move(moves[0]);
         }
@@ -2912,7 +4316,91 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
   return current;
 }
 
+Solution Perturbation::repair_preserving_stations(
+    DestroyedSolution destroyed, RepairOperator operation,
+    double penalty_lambda) {
+  Solution current = std::move(destroyed.remaining);
+  std::vector<int> unassigned = std::move(destroyed.removed_customers);
+  std::vector<std::unique_ptr<PhysicalRouteScorer>> scorers;
+  scorers.reserve(current.plans.size() + unassigned.size());
+  for (const Plan& plan : current.plans) {
+    scorers.push_back(std::make_unique<PhysicalRouteScorer>(instance_, plan));
+    ++statistics_.physical_route_profiles_built;
+  }
+  NonlinearSequenceEvaluator singleton_scorer(instance_);
+  while (!unassigned.empty()) {
+    ++statistics_.physical_insertion_decisions;
+    std::optional<InsertionMove> chosen;
+    double best_regret = -1.0;
+    for (const int customer : unassigned) {
+      std::vector<InsertionMove> moves;
+      for (std::size_t route = 0; route < current.plans.size(); ++route) {
+        const Plan& plan = current.plans[route];
+        const double incumbent = generalized_cost(
+            *plan.evaluation, instance_, penalty_lambda);
+        for (std::size_t slot = 0; slot <= plan.route.visits.size(); ++slot) {
+          const double delta = generalized_cost(
+              scorers[route]->evaluate_insertion(slot, customer), instance_,
+              penalty_lambda) - incumbent;
+          moves.push_back(InsertionMove{.customer_id = customer,
+                                        .route_index = route,
+                                        .position = slot,
+                                        .incumbent_route_cost = incumbent,
+                                        .direct_delta = delta,
+                                        .linked_lower_bound_delta = delta,
+                                        .delta = delta});
+        }
+      }
+      const double singleton_cost = singleton_scorer.generalized_cost(
+          singleton_scorer.route_label(Route{{customer}}), penalty_lambda);
+      moves.push_back(InsertionMove{.customer_id = customer,
+                                    .route_index = current.plans.size(),
+                                    .position = 0,
+                                    .incumbent_route_cost = 0.0,
+                                    .direct_delta = singleton_cost,
+                                    .linked_lower_bound_delta = singleton_cost,
+                                    .delta = singleton_cost});
+      statistics_.physical_insertion_candidates += moves.size();
+      if (operation == RepairOperator::GreedyInsertion) {
+        const auto best = std::min_element(moves.begin(), moves.end(),
+                                           insertion_better);
+        if (!chosen.has_value() || insertion_better(*best, *chosen)) chosen = *best;
+      } else {
+        const auto count = std::min<std::size_t>(2, moves.size());
+        std::partial_sort(moves.begin(), moves.begin() +
+            static_cast<std::ptrdiff_t>(count), moves.end(), insertion_better);
+        const double regret = count == 1 ? std::numeric_limits<double>::infinity()
+                                        : moves[1].delta - moves[0].delta;
+        if (!chosen.has_value() ||
+            regret_better(regret, moves[0], best_regret, *chosen)) {
+          chosen = moves[0];
+          best_regret = regret;
+        }
+      }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const std::size_t route = chosen->route_index;
+    const int customer = chosen->customer_id;
+    std::vector<int> visits = route == current.plans.size()
+        ? std::vector<int>{} : current.plans[route].route.visits;
+    visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(chosen->position),
+                  customer);
+    apply_insertion(current, route, factory_.plan_visits(std::move(visits)));
+    std::erase(unassigned, customer);
+    if (!unassigned.empty()) {
+      auto updated = std::make_unique<PhysicalRouteScorer>(instance_, current.plans[route]);
+      if (route == scorers.size()) scorers.push_back(std::move(updated));
+      else scorers[route] = std::move(updated);
+      ++statistics_.physical_route_profiles_built;
+    }
+    statistics_.repair_timing.winner_materialization_s += elapsed_seconds(started);
+  }
+  current.validate_partition(instance_);
+  return current;
+}
+
 Solution Perturbation::apply(const Solution& solution, double penalty_lambda) {
+  last_removal_count_ = 0;
   const std::size_t customers = instance_.customer_ids().size();
   const std::size_t lower = std::min<std::size_t>(customers, 3);
   const std::size_t upper = std::max(
@@ -2927,6 +4415,7 @@ Solution Perturbation::apply(const Solution& solution, double penalty_lambda) {
   const auto destroy_started = std::chrono::steady_clock::now();
   DestroyedSolution destroyed =
       destroy(solution, destroy_operation, removal_count, penalty_lambda);
+  last_removal_count_ = destroyed.removed_customers.size();
   statistics_.repair_timing.destroy_s += elapsed_seconds(destroy_started);
   Solution repaired = repair(
       std::move(destroyed), repair_operation, penalty_lambda,
@@ -2941,16 +4430,43 @@ Solution Perturbation::apply(const Solution& solution, double penalty_lambda) {
   return std::move(hinted.solution);
 }
 
+double VariableNeighborhoodDescent::PhysicalScoreSummary::generalized_cost(
+    const Instance& instance, double penalty_lambda) const {
+  if (!std::isfinite(penalty_lambda) || penalty_lambda < 0.0) {
+    throw std::invalid_argument("penalty lambda must be finite and nonnegative");
+  }
+  // Identical operations/ordering to generalized_cost(RouteCostSummary).
+  return raw_cost_h +
+         penalty_lambda *
+             (energy_shortfall_wh /
+                  instance.vehicle().consumption_wh_per_km +
+              duration_excess_h);
+}
+
 VariableNeighborhoodDescent::VariableNeighborhoodDescent(
     const Instance& instance, PlanFactory& factory, PathSampler& path_sampler,
     std::mt19937_64& random, std::size_t promising_arc_count,
-    SearchProfile profile)
+    SearchProfile profile, std::size_t replace_path_attempts,
+    bool project_opening_station_visits, bool preserve_swap_station_visits)
     : instance_(instance),
       factory_(factory),
       granular_(instance, promising_arc_count),
       path_sampler_(path_sampler),
       random_(random),
-      profile_(profile) {}
+      profile_(profile),
+      replace_path_attempts_(replace_path_attempts),
+      project_opening_station_visits_(project_opening_station_visits),
+      preserve_swap_station_visits_(preserve_swap_station_visits) {
+  if (preserve_swap_station_visits_ && profile_ != SearchProfile::Paper) {
+    throw std::invalid_argument("physical-slot Swap requires the paper profile");
+  }
+  if (replace_path_attempts_ != 1) {
+    throw std::invalid_argument("only the single-proposal ReplacePath stage is active; the four-trial experiment was rejected");
+  }
+  if (project_opening_station_visits_ && profile_ != SearchProfile::Paper) {
+    throw std::invalid_argument("projected route opening requires the paper profile");
+  }
+}
 
 bool VariableNeighborhoodDescent::expired(
     std::optional<std::chrono::steady_clock::time_point> deadline) const {
@@ -2959,10 +4475,56 @@ bool VariableNeighborhoodDescent::expired(
 
 Solution VariableNeighborhoodDescent::improve(
     Solution solution, double penalty_lambda,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
-  move_memory_.clear();
-  route_versions_.clear();
-  next_route_version_ = 1;
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::optional<std::size_t> cooperative_removal_count) {
+  if (cooperative_removal_count.has_value() &&
+      (profile_ != SearchProfile::Paper || path_sampler_.implicit_replacement_)) {
+    throw std::invalid_argument(
+        "cooperative RP requires the Paper profile and explicit path sampling");
+  }
+  // Reuse only complete customer-support winners at the identical lambda.
+  // Absolute opening slots also require the same global route count.
+  const bool reuse_scope = cooperative_removal_count.has_value() &&
+      profile_ == SearchProfile::Paper && supported_bound_fp_environment();
+  if (!reuse_scope || !move_memory_reusable_ ||
+      !move_memory_lambda_.has_value() ||
+      *move_memory_lambda_ != penalty_lambda ||
+      move_memory_route_count_ != solution.plans.size()) {
+    move_memory_.clear();
+    route_versions_.clear();
+    next_route_version_ = 1;
+  }
+  move_memory_usable_ = true;
+  move_memory_reusable_ = reuse_scope;
+  move_memory_lambda_ = penalty_lambda;
+  move_memory_route_count_ = solution.plans.size();
+
+  // All schedule state is local to this VND. Accepted moves invalidate only
+  // the current layout's selector; they never replenish the proposal budget.
+  constexpr std::size_t no_deficit_index =
+      std::numeric_limits<std::size_t>::max();
+  struct CooperativePathState {
+    std::size_t remaining{};
+    std::vector<std::pair<std::size_t, std::size_t>> gaps;
+    std::size_t next_gap{};
+    bool selector_valid{};
+    // Positions in gaps, plus their inverse indices, for O(1) removal.
+    std::vector<std::size_t> deficit_positions;
+    std::vector<std::size_t> deficit_index;
+  };
+  std::optional<CooperativePathState> cooperative;
+  std::size_t entry_allowance = 0;
+  if (cooperative_removal_count.has_value()) {
+    cooperative.emplace();
+    std::size_t entry_gap_count = 0;
+    for (const Plan& plan : solution.plans) entry_gap_count += plan.gaps.size();
+    entry_allowance = std::min(*cooperative_removal_count, entry_gap_count);
+    // min(G_entry, 2*kappa), without overflowing the doubling operation.
+    cooperative->remaining = entry_allowance +
+        std::min(*cooperative_removal_count, entry_gap_count - entry_allowance);
+    ++statistics_.cooperative_vnd_calls;
+    statistics_.cooperative_proposal_budget += cooperative->remaining;
+  }
 
   const auto accept = [&](std::optional<Solution> candidate) {
     if (!candidate.has_value() ||
@@ -2976,6 +4538,14 @@ Solution VariableNeighborhoodDescent::improve(
     solution = std::move(*candidate);
     if (solution.plans.size() != previous_route_count) {
       move_memory_.clear();
+      move_memory_route_count_ = solution.plans.size();
+    }
+    if (cooperative.has_value()) {
+      cooperative->gaps.clear();
+      cooperative->deficit_positions.clear();
+      cooperative->deficit_index.clear();
+      cooperative->next_gap = 0;
+      cooperative->selector_valid = false;
     }
     return true;
   };
@@ -3013,51 +4583,381 @@ Solution VariableNeighborhoodDescent::improve(
     return solution;
   }
 
-  std::size_t neighborhood_index = 0;
-  while (neighborhood_index < order_.size() && !expired(deadline)) {
-    auto best = best_neighbor(solution, order_[neighborhood_index],
-                              penalty_lambda, deadline);
-    // A linked completion may have reached the absolute deadline while
-    // constructing a temporary endpoint.  Do not publish any partial
-    // completion after the boundary.
+  const auto cooperative_neighbor = [&](std::size_t allowance, bool entry_phase)
+      -> std::optional<Solution> {
+    ++statistics_.replace_path_calls;
+    auto& state = *cooperative;
+    if (state.remaining == 0 || allowance == 0 || expired(deadline)) {
+      return std::nullopt;
+    }
+#if ILS_SP_TYPED_DELETE_ENTRY
+    std::vector<std::size_t> deletion_positions;
+#endif
+    if (!state.selector_valid) {
+      for (std::size_t route = 0; route < solution.plans.size(); ++route) {
+        const Plan& plan = solution.plans[route];
+        const bool energy_deficient =
+            plan.evaluation->energy_shortfall_wh > kEnergyToleranceWh;
+        for (std::size_t gap = 0; gap < plan.gaps.size(); ++gap) {
+          const std::size_t position = state.gaps.size();
+          state.gaps.emplace_back(route, gap);  // Includes direct gaps.
+#if ILS_SP_TYPED_DELETE_ENTRY
+          // Every explicit catalogue includes its direct path unconditionally.
+          // Build once at VND entry, with no catalogue lookup or extra scoring.
+          if (entry_phase && !plan.gaps[gap].empty()) {
+            deletion_positions.push_back(position);
+          }
+#endif
+          state.deficit_index.push_back(energy_deficient
+              ? state.deficit_positions.size() : no_deficit_index);
+          if (energy_deficient) state.deficit_positions.push_back(position);
+        }
+      }
+      state.selector_valid = true;
+    }
+    const double current_cost =
+        generalized_cost(solution, instance_, penalty_lambda);
+    const std::size_t attempts = std::min(allowance, state.remaining);
+    for (std::size_t attempt = 0;
+         attempt < attempts && state.next_gap < state.gaps.size(); ++attempt) {
+      if (expired(deadline)) break;
+      std::optional<std::mt19937_64> before_catalogue_read;
+      if (path_sampler_.catalog_disk_cache_.enabled) {
+        before_catalogue_read.emplace(random_);
+      }
+      // Half the draws favor gaps on routes with an actual retained energy
+      // shortfall; half remain uniform over every unvisited gap. If neither
+      // branch can differ, preserve the legacy draw and its RNG consumption.
+      // BEGIN_DEFICIT_GAP_DRAW
+      const std::size_t unvisited = state.gaps.size() - state.next_gap;
+#if ILS_SP_TYPED_DELETE_ENTRY
+      const bool typed_deletion = entry_phase && attempt == 0 &&
+          !deletion_positions.empty();
+      std::size_t selected;
+      if (typed_deletion) {
+        selected = deletion_positions[std::uniform_int_distribution<std::size_t>(
+            0, deletion_positions.size() - 1)(random_)];
+      } else {
+#endif
+      const bool favor_deficit = !state.deficit_positions.empty() &&
+          state.deficit_positions.size() < unvisited &&
+          std::bernoulli_distribution(0.5)(random_);
+#if ILS_SP_TYPED_DELETE_ENTRY
+      selected = favor_deficit
+#else
+      const std::size_t selected = favor_deficit
+#endif
+          ? state.deficit_positions[std::uniform_int_distribution<std::size_t>(
+                0, state.deficit_positions.size() - 1)(random_)]
+          : std::uniform_int_distribution<std::size_t>(
+                state.next_gap, state.gaps.size() - 1)(random_);
+#if ILS_SP_TYPED_DELETE_ENTRY
+      }
+#endif
+#if ILS_SP_TYPED_DELETE_ENTRY
+      const auto selected_gap = state.gaps[selected];
+      // Typed proposals have their own one-shot allowance, not an ordinary
+      // gap visit. A rejected deletion leaves every ordinary path reachable.
+      if (!typed_deletion) {
+#endif
+      const std::size_t first = state.next_gap;
+      const std::size_t first_deficit = state.deficit_index[first];
+      const std::size_t selected_deficit = state.deficit_index[selected];
+      std::swap(state.gaps[first], state.gaps[selected]);
+      std::swap(state.deficit_index[first], state.deficit_index[selected]);
+      if (first_deficit != no_deficit_index) {
+        state.deficit_positions[first_deficit] = selected;
+      }
+      if (selected_deficit != no_deficit_index) {
+        state.deficit_positions[selected_deficit] = first;
+        const std::size_t last_position = state.deficit_positions.back();
+        state.deficit_positions[selected_deficit] = last_position;
+        state.deficit_index[last_position] = selected_deficit;
+        state.deficit_positions.pop_back();
+      }
+      state.deficit_index[first] = no_deficit_index;
+#if ILS_SP_TYPED_DELETE_ENTRY
+      ++state.next_gap;
+      }
+      const auto [route, gap] = selected_gap;
+#else
+      const auto [route, gap] = state.gaps[state.next_gap++];
+#endif
+      // END_DEFICIT_GAP_DRAW
+      --state.remaining;
+      ++statistics_.replace_path_proposals;
+      if (entry_phase) ++statistics_.cooperative_entry_proposals;
+      const Plan& plan = solution.plans[route];
+      const int origin = gap == 0 ? instance_.depot().id
+                                  : plan.customer_ids[gap - 1];
+      const int target = gap == plan.customer_ids.size() ? instance_.depot().id
+                                                        : plan.customer_ids[gap];
+      std::optional<std::vector<int>> sampled;
+      try {
+        // One indexed uniform alternative, excluding every copy of the old
+        // path exactly as in legacy RP. No all-alternative scoring occurs.
+#if ILS_SP_TYPED_DELETE_ENTRY
+        if (typed_deletion) {
+          sampled.emplace();  // The catalogue direct path, not a charging repair.
+        } else
+#endif
+        {
+        sampled = path_sampler_.sample_explicit_path(origin, target, plan.gaps[gap]);
+        }
+      } catch (...) {
+        // Match legacy RP's rollback of the gap draw on a failed disk read.
+        if (before_catalogue_read) random_ = *before_catalogue_read;
+        throw;
+      }
+      if (!sampled.has_value()) {
+        ++statistics_.replace_path_null_proposals;
+        continue;
+      }
+      if (expired(deadline)) break;
+      auto gaps = plan.gaps;
+      gaps[gap] = std::move(*sampled);
+      Plan proposed = factory_.make_plan(plan.customer_ids, std::move(gaps));
+      if (expired(deadline)) break;
+      // Preserve generalized_cost(Solution)'s route addition order; no delta
+      // or subtract/add update, and no change to this VND's penalty lambda.
+      double candidate_cost = 0.0;
+      for (std::size_t index = 0; index < solution.plans.size(); ++index) {
+        const Plan& candidate_plan = index == route ? proposed : solution.plans[index];
+        candidate_cost += generalized_cost(
+            *candidate_plan.evaluation, instance_, penalty_lambda);
+      }
+      if (candidate_cost < current_cost - kCostTolerance) {
+        if (expired(deadline)) break;
+        ++statistics_.replace_path_accepted;
+        Solution candidate = solution;
+        candidate.plans[route] = std::move(proposed);
+        return candidate;  // First improvement, never best-of-budget.
+      }
+      ++statistics_.replace_path_nonimproving_proposals;
+    }
+    return std::nullopt;
+  };
+
+  // Entry is attempted exactly once. An accepted RP returns to Swap just as
+  // a normal tail RP does; an unused entry allowance stays in the total budget.
+  if (cooperative.has_value() && !expired(deadline)) {
+    auto entry = cooperative_neighbor(entry_allowance, true);
+    if (!expired(deadline)) accept(std::move(entry));
+  }
+  // Experimental remaining-list RVND for cooperative calls. Legacy calls
+  // still choose the first remaining bit, preserving their fixed-order RNG.
+  const auto active_neighborhoods = [&]() {
+    unsigned int active = (1U << order_.size()) - 1U;
+    if (cooperative.has_value() && cooperative->remaining == 0) {
+      active &= ~(1U << 3);  // RP has no tokens; never refill on a restart.
+    }
+    return active;
+  };
+  unsigned int remaining = active_neighborhoods();
+  while (remaining != 0 && !expired(deadline)) {
+    const std::size_t neighborhood_index = cooperative.has_value()
+        ? select_active_neighborhood(remaining)
+        : static_cast<std::size_t>(std::countr_zero(remaining));
+    if (cooperative.has_value()) ++statistics_.rvnd_neighborhood_selections;
+    auto best = cooperative.has_value() &&
+                        order_[neighborhood_index] == Neighborhood::ReplacePath
+        ? cooperative_neighbor(cooperative->remaining, false)
+        : best_neighbor(solution, order_[neighborhood_index],
+                        penalty_lambda, deadline, cooperative.has_value());
     if (expired(deadline)) break;
-    // Customer moves are ranked by the same incremental direct-gap scorer in
-    // every profile.  LinkedWinner may deterministically improve only the
-    // selected winner's newly-created gaps before this full acceptance check.
     if (accept(std::move(best))) {
-      neighborhood_index = 0;
+      remaining = active_neighborhoods();
+      if (cooperative.has_value()) ++statistics_.rvnd_improvement_resets;
     } else {
-      ++neighborhood_index;
+      remaining &= ~(1U << neighborhood_index);
     }
   }
   solution.validate_partition(instance_);
   return solution;
 }
 
+std::size_t VariableNeighborhoodDescent::select_active_neighborhood(
+    unsigned int active) {
+  const unsigned int allowed = (1U << order_.size()) - 1U;
+  if (active == 0 || (active & ~allowed) != 0) {
+    throw std::invalid_argument("RVND active set is empty or invalid");
+  }
+  const unsigned int count = static_cast<unsigned int>(std::popcount(active));
+  unsigned int ordinal = count == 1 ? 0
+      : std::uniform_int_distribution<unsigned int>(0, count - 1)(random_);
+  for (std::size_t index = 0; index < order_.size(); ++index) {
+    if ((active & (1U << index)) != 0 && ordinal-- == 0) return index;
+  }
+  throw std::logic_error("RVND active ordinal is out of range");
+}
+
 std::optional<Solution> VariableNeighborhoodDescent::best_neighbor(
     const Solution& solution, Neighborhood neighborhood, double penalty_lambda,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    bool cooperative_physical_customers) {
   if (neighborhood == Neighborhood::ReplacePath) {
-    return replace_path_neighbor(solution, penalty_lambda);
+    return replace_path_neighbor(solution, penalty_lambda, deadline);
   }
   return best_customer_neighbor(solution, neighborhood, penalty_lambda,
-                                deadline);
+                                deadline, cooperative_physical_customers);
+}
+
+void VariableNeighborhoodDescent::order_relocate_moves(
+    const std::vector<std::vector<int>>& current) {
+  if (relocate_moves_.size() < 2) return;
+  const auto& customers = instance_.customer_ids();
+  // Montoya IDs are 1..N in order. Retain the original comparison for other
+  // layouts, rather than assigning a new rank that would change tuple order.
+  for (std::size_t i = 0; i < customers.size(); ++i) {
+    if (customers[i] != static_cast<int>(i + 1)) {
+      std::sort(relocate_moves_.begin(), relocate_moves_.end());
+      relocate_moves_.erase(std::unique(relocate_moves_.begin(),
+                                        relocate_moves_.end()),
+                             relocate_moves_.end());
+      return;
+    }
+  }
+  order_gap_offsets_.resize(current.size() + 1);
+  std::size_t columns = 0;
+  for (std::size_t route = 0; route < current.size(); ++route) {
+    order_gap_offsets_[route] = columns;
+    columns += current[route].size() + 1;
+  }
+  order_gap_offsets_.back() = columns++;
+  if (customers.size() > relocate_order_flags_.max_size() / columns) {
+    throw std::length_error("Relocate ordering workspace is too large");
+  }
+  relocate_order_flags_.assign(customers.size() * columns, 0);
+  for (const auto& [customer, route, gap] : relocate_moves_) {
+    relocate_order_flags_[(static_cast<std::size_t>(customer) - 1) * columns +
+                          order_gap_offsets_[route] + gap] = 1;
+  }
+  relocate_moves_.clear();
+  for (std::size_t rank = 0; rank < customers.size(); ++rank) {
+    for (std::size_t route = 0; route <= current.size(); ++route) {
+      const std::size_t count = route == current.size()
+                                    ? 1 : current[route].size() + 1;
+      for (std::size_t gap = 0; gap < count; ++gap) {
+        if (relocate_order_flags_[rank * columns + order_gap_offsets_[route] + gap]) {
+          relocate_moves_.emplace_back(customers[rank], route, gap);
+        }
+      }
+    }
+  }
+}
+
+void VariableNeighborhoodDescent::order_two_opt_moves(
+    const std::vector<std::vector<int>>& current) {
+  if (two_opt_moves_.size() < 2) return;
+  order_gap_offsets_.resize(current.size());
+  std::size_t columns = 0;
+  for (std::size_t route = 0; route < current.size(); ++route) {
+    order_gap_offsets_[route] = columns;
+    columns += current[route].size() + 1;
+  }
+  if (columns == 0 || columns > two_opt_order_flags_.max_size() / 2 / columns) {
+    throw std::length_error("2-OPT ordering workspace is too large");
+  }
+  two_opt_order_flags_.assign(2 * columns * columns, 0);
+  for (const auto& [left, right, left_cut, right_cut, reversed] : two_opt_moves_) {
+    two_opt_order_flags_[2 * ((order_gap_offsets_[left] + left_cut) * columns +
+                               order_gap_offsets_[right] + right_cut) + reversed] = 1;
+  }
+  two_opt_moves_.clear();
+  // The nesting matches the original five-field tuple's lexicographic order.
+  for (std::size_t left = 0; left < current.size(); ++left) {
+    for (std::size_t right = left + 1; right < current.size(); ++right) {
+      for (std::size_t left_cut = 0; left_cut <= current[left].size(); ++left_cut) {
+        for (std::size_t right_cut = 0; right_cut <= current[right].size(); ++right_cut) {
+          const std::size_t index = 2 * ((order_gap_offsets_[left] + left_cut) * columns +
+                                        order_gap_offsets_[right] + right_cut);
+          for (const bool reversed : {false, true}) {
+            if (two_opt_order_flags_[index + reversed]) {
+              two_opt_moves_.emplace_back(left, right, left_cut, right_cut, reversed);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+bool VariableNeighborhoodDescent::described_move_less(
+    const MoveDescriptor& left, const MoveDescriptor& right,
+    const std::vector<std::vector<int>>& current) {
+  // The original tie-break is lexicographic over (route slot, customer vector)
+  // pairs. Traverse the same vectors through their slices without allocating.
+  for (std::size_t change = 0;
+       change < std::min(left.change_count, right.change_count); ++change) {
+    const auto& a = left.changes[change];
+    const auto& b = right.changes[change];
+    if (a.route != b.route) return a.route < b.route;
+    std::size_t a_slice = 0, b_slice = 0, a_offset = 0, b_offset = 0;
+    while (true) {
+      while (a_slice < a.slice_count &&
+             a_offset == a.slices[a_slice].end - a.slices[a_slice].begin) {
+        ++a_slice;
+        a_offset = 0;
+      }
+      while (b_slice < b.slice_count &&
+             b_offset == b.slices[b_slice].end - b.slices[b_slice].begin) {
+        ++b_slice;
+        b_offset = 0;
+      }
+      if (a_slice == a.slice_count || b_slice == b.slice_count) {
+        if (a_slice == a.slice_count && b_slice == b.slice_count) break;
+        return a_slice == a.slice_count;
+      }
+      const auto& as = a.slices[a_slice];
+      const auto& bs = b.slices[b_slice];
+      const int ac = current[as.route_index][
+          as.reversed ? as.end - 1 - a_offset : as.begin + a_offset];
+      const int bc = current[bs.route_index][
+          bs.reversed ? bs.end - 1 - b_offset : bs.begin + b_offset];
+      if (ac != bc) return ac < bc;
+      ++a_offset;
+      ++b_offset;
+    }
+  }
+  return left.change_count < right.change_count;
 }
 
 std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     const Solution& solution, Neighborhood neighborhood, double penalty_lambda,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    bool cooperative_physical_customers) {
+  const bool physical_reverse_mode = cooperative_physical_customers &&
+      profile_ == SearchProfile::Paper &&
+      neighborhood == Neighborhood::TwoOptStar;
+  const bool physical_relocate_mode = cooperative_physical_customers &&
+      profile_ == SearchProfile::Paper && neighborhood == Neighborhood::Relocate;
   ++statistics_.customer_neighborhood_calls;
   const auto current = solution.customer_sequences();
-  const auto reference_gaps = factory_.gap_map(solution);
-  if (sequence_scorer_ == nullptr) {
-    sequence_scorer_ = std::make_unique<RouteSequenceScorer>(
-        instance_, solution, reference_gaps);
-  } else {
-    sequence_scorer_->reset(solution, reference_gaps);
-  }
-  const RouteSequenceScorer& scorer = *sequence_scorer_;
+  // Physical operators and support-memory hits do not need reconstructed
+  // customer-gap labels. Materialize that legacy input only at its first use.
+  std::optional<PlanFactory::GapMap> reference_gaps;
+  const auto ensure_reference_gaps = [&]() -> const PlanFactory::GapMap& {
+    if (!reference_gaps.has_value()) reference_gaps = factory_.gap_map(solution);
+    return *reference_gaps;
+  };
+  bool sequence_scorer_ready = false;
+  const auto ensure_sequence_scorer = [&]() -> const RouteSequenceScorer& {
+    if (!sequence_scorer_ready) {
+      const auto& gaps = ensure_reference_gaps();
+      if (sequence_scorer_ == nullptr) {
+        sequence_scorer_ = std::make_unique<RouteSequenceScorer>(
+            instance_, solution, gaps);
+      } else {
+        // Reset on the first actual use in EVERY pass, even when the physical
+        // calls in between left this persistent object pointing at old routes.
+        sequence_scorer_->reset(solution, gaps);
+      }
+      sequence_scorer_ready = true;
+    }
+    return *sequence_scorer_;
+  };
   auto prepared_plan = [&](const std::vector<int>& sequence) {
+    const auto& gaps_by_anchor = ensure_reference_gaps();
     auto gaps = direct_gaps(sequence.size());
     std::vector<int> anchors;
     anchors.reserve(sequence.size() + 2);
@@ -3066,8 +4966,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     anchors.push_back(instance_.depot().id);
     for (std::size_t gap = 0; gap + 1 < anchors.size(); ++gap) {
       const auto known =
-          reference_gaps.find(AnchorPair{anchors[gap], anchors[gap + 1]});
-      if (known != reference_gaps.end()) gaps[gap] = known->second;
+          gaps_by_anchor.find(AnchorPair{anchors[gap], anchors[gap + 1]});
+      if (known != gaps_by_anchor.end()) gaps[gap] = known->second;
     }
     return factory_.make_plan(sequence, std::move(gaps));
   };
@@ -3078,15 +4978,6 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
         generalized_cost(*plan.evaluation, instance_, penalty_lambda));
   }
 
-  std::vector<std::uint64_t> current_route_versions;
-  current_route_versions.reserve(solution.plans.size());
-  for (const Plan& plan : solution.plans) {
-    auto [version, inserted] = route_versions_.try_emplace(
-        plan.route.visits, next_route_version_);
-    if (inserted) ++next_route_version_;
-    current_route_versions.push_back(version->second);
-  }
-
   struct CustomerLocation {
     std::size_t route{};
     std::size_t position{};
@@ -3094,6 +4985,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   };
   const std::size_t customer_count = instance_.customer_ids().size();
   std::vector<CustomerLocation> location(customer_count);
+  std::vector<bool> customer_seen(customer_count, false);
+  bool canonical_physical_input = true;
   std::vector<std::vector<std::size_t>> current_ranks;
   current_ranks.reserve(current.size());
   for (std::size_t route = 0; route < current.size(); ++route) {
@@ -3103,44 +4996,101 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
          ++position) {
       const std::size_t rank =
           granular_.customer_rank(current[route][position]);
+      if (customer_seen[rank]) canonical_physical_input = false;
+      customer_seen[rank] = true;
       location[rank] = CustomerLocation{route, position, rank};
       route_ranks.push_back(rank);
     }
     current_ranks.push_back(std::move(route_ranks));
   }
+  canonical_physical_input = canonical_physical_input &&
+      std::all_of(customer_seen.begin(), customer_seen.end(),
+                  [](bool seen) { return seen; });
+  // A physical visit sequence identifies the scoring input only when its
+  // customer/gap metadata agree and the partition has unique customers.
+  // Unsupported public inputs retain the original uncached scoring path.
+  std::vector<std::uint64_t> physical_ids(current.size(), 0);
+  if (canonical_physical_input) {
+    for (const Plan& plan : solution.plans) {
+      if (plan.gaps.size() != plan.customer_ids.size() + 1) {
+        canonical_physical_input = false;
+        break;
+      }
+      // expand_route stores the interior visits; depot legs are implicit.
+      std::size_t visit = 0;
+      const auto matches = [&](int id) {
+        return visit < plan.route.visits.size() &&
+               plan.route.visits[visit++] == id;
+      };
+      for (std::size_t gap = 0; gap < plan.gaps.size(); ++gap) {
+        for (const int station : plan.gaps[gap]) {
+          if (!matches(station)) canonical_physical_input = false;
+        }
+        if (gap < plan.customer_ids.size() && !matches(plan.customer_ids[gap])) {
+          canonical_physical_input = false;
+        }
+      }
+      if (visit != plan.route.visits.size()) canonical_physical_input = false;
+      if (!canonical_physical_input) break;
+    }
+    if (canonical_physical_input && physical_summary_budget_ != 0) {
+      for (std::size_t route = 0; route < current.size(); ++route) {
+        const auto& visits = solution.plans[route].route.visits;
+        // Bound registry payload too; longer routes are evaluated normally.
+        if (visits.size() > 256) continue;
+        if (const auto id = physical_route_ids_.get(visits); id.has_value()) {
+          physical_ids[route] = *id;
+        } else if (next_physical_route_id_ != 0) {
+          physical_ids[route] = next_physical_route_id_++;
+          physical_route_ids_.put(visits, physical_ids[route]);
+        }
+      }
+    }
+  }
+  // Unsupported metadata must never hit or publish a remembered descriptor.
+  // Bound identity payload by physical length; weak evaluation owners retain
+  // no charge/SOC vectors. Registry eviction assigns a new, never recycled ID.
+  if (!canonical_physical_input || std::any_of(
+          solution.plans.begin(), solution.plans.end(), [](const Plan& plan) {
+            return plan.route.visits.size() > 256;
+          })) {
+    move_memory_.clear();
+    route_versions_.clear();
+    next_route_version_ = 1;
+    move_memory_usable_ = false;
+    move_memory_reusable_ = false;
+  }
+  std::vector<std::uint64_t> current_route_versions(current.size(), 0);
+  if (move_memory_usable_) {
+    // Reserve enough IDs for this whole pass before assigning any of them.
+    if (next_route_version_ > std::numeric_limits<std::uint64_t>::max() -
+                                  current.size()) {
+      move_memory_.clear();
+      route_versions_.clear();
+      next_route_version_ = 1;
+    }
+    for (std::size_t route = 0; route < current.size(); ++route) {
+      const Plan& plan = solution.plans[route];
+      const auto known = route_versions_.get(plan.route.visits);
+      if (known.has_value() && known->evaluation.lock() == plan.evaluation) {
+        current_route_versions[route] = known->id;
+      } else {
+        current_route_versions[route] = next_route_version_++;
+        route_versions_.put(plan.route.visits, RouteStateVersion{
+            .id = current_route_versions[route], .evaluation = plan.evaluation});
+      }
+    }
+  }
   const auto customer_location = [&](int customer_id) -> CustomerLocation {
     return location[granular_.customer_rank(customer_id)];
   };
-  const auto is_current_arc = [&](std::size_t origin_rank,
-                                  std::size_t target_rank) {
-    const CustomerLocation& origin = location[origin_rank];
-    const CustomerLocation& target = location[target_rank];
-    return origin.route == target.route &&
-           origin.position + 1 == target.position;
-  };
-
-  // Forward slice arcs already belong to the incumbent.  A reversed slice can
-  // introduce promising arcs internally, so retain a prefix count for those
-  // arcs and make the final granular guard constant in the number of slices.
-  std::vector<std::vector<std::size_t>> reverse_promising_prefix;
-  reverse_promising_prefix.reserve(current.size());
-  for (const auto& sequence : current_ranks) {
-    std::vector<std::size_t> prefix(sequence.size(), 0);
-    for (std::size_t position = 0; position + 1 < sequence.size();
-         ++position) {
-      prefix[position + 1] =
-          prefix[position] +
-          static_cast<std::size_t>(
-              !is_current_arc(sequence[position + 1], sequence[position]) &&
-              granular_.promising_by_rank(sequence[position + 1],
-                                           sequence[position]));
-    }
-    reverse_promising_prefix.push_back(std::move(prefix));
-  }
-
   const auto add_slice = [&](DescribedRouteChange& change,
                              std::size_t source_route, std::size_t begin,
-                             std::size_t end, bool reversed = false) {
+                             std::size_t end, bool reversed = false)
+#if defined(__GNUC__) || defined(__clang__)
+      __attribute__((always_inline))
+#endif
+  {
     if (begin == end) return;
     if (source_route >= current.size() || begin > end ||
         end > current[source_route].size()) {
@@ -3156,23 +5106,35 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
         .reversed = reversed};
   };
 
-  const auto one_change = [](DescribedRouteChange change) {
-    MoveDescriptor move;
-    move.changes[0] = std::move(change);
-    move.change_count = 1;
-    return move;
+  // Only the active changes/slices are read. Reuse initialized storage within
+  // this pass instead of transferring full arrays for every descriptor. A
+  // remembered winner still owns its complete copy before the next reset.
+  MoveDescriptor candidate_move;
+  const auto one_change = [&](std::size_t route) -> DescribedRouteChange& {
+    candidate_move.change_count = 1;
+    candidate_move.physical_reverse_two_opt = false;
+    candidate_move.physical_forward_two_opt = false;
+    candidate_move.physical_relocate = false;
+    auto& change = candidate_move.changes[0];
+    change.route = route;
+    change.slice_count = 0;
+    return change;
   };
-  const auto two_changes = [](DescribedRouteChange first,
-                              DescribedRouteChange second) {
-    if (first.route == second.route) {
+  const auto two_changes = [&](std::size_t first_route,
+                               std::size_t second_route) {
+    if (first_route == second_route) {
       throw std::logic_error("move descriptor changes one route twice");
     }
-    if (second.route < first.route) std::swap(first, second);
-    MoveDescriptor move;
-    move.changes[0] = std::move(first);
-    move.changes[1] = std::move(second);
-    move.change_count = 2;
-    return move;
+    candidate_move.change_count = 2;
+    candidate_move.physical_reverse_two_opt = false;
+    candidate_move.physical_forward_two_opt = false;
+    candidate_move.physical_relocate = false;
+    auto& first = candidate_move.changes[first_route < second_route ? 0 : 1];
+    auto& second = candidate_move.changes[first_route < second_route ? 1 : 0];
+    first.route = first_route;
+    second.route = second_route;
+    first.slice_count = second.slice_count = 0;
+    return std::tie(first, second);
   };
 
   const auto materialize_route = [&](const DescribedRouteChange& change) {
@@ -3215,48 +5177,16 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   };
   const auto move_less = [&](const MoveDescriptor& left,
                              const MoveDescriptor& right) {
-    return materialize_changes(left) < materialize_changes(right);
-  };
-
-  const auto first_customer_rank = [&](const IncumbentRouteSlice& slice) {
-    return slice.reversed
-               ? current_ranks[slice.route_index][slice.end - 1]
-               : current_ranks[slice.route_index][slice.begin];
-  };
-  const auto last_customer_rank = [&](const IncumbentRouteSlice& slice) {
-    return slice.reversed
-               ? current_ranks[slice.route_index][slice.begin]
-               : current_ranks[slice.route_index][slice.end - 1];
-  };
-  const auto move_allowed = [&](const MoveDescriptor& move) {
-    if (granular_.gamma_size() == 0) return true;
-    for (std::size_t change_index = 0;
-         change_index < move.change_count; ++change_index) {
-      const DescribedRouteChange& change = move.changes[change_index];
-      std::optional<std::size_t> previous;
-      for (std::size_t slice_index = 0;
-           slice_index < change.slice_count; ++slice_index) {
-        const IncumbentRouteSlice& slice = change.slices[slice_index];
-        if (slice.reversed && slice.end > slice.begin + 1) {
-          const auto& prefix =
-              reverse_promising_prefix[slice.route_index];
-          if (prefix[slice.end - 1] > prefix[slice.begin]) return true;
-        }
-        const std::size_t first = first_customer_rank(slice);
-        if (previous.has_value() &&
-            !is_current_arc(*previous, first) &&
-            granular_.promising_by_rank(*previous, first)) {
-          return true;
-        }
-        previous = last_customer_rank(slice);
-      }
-    }
-    return false;
+    return described_move_less(left, right, current);
   };
 
   const std::size_t route_count = current.size();
   const std::size_t support_count =
       route_count * route_count + 2 * route_count;
+  // Pin each queried support table once per pass, rather than locking a weak
+  // pointer for every descriptor. LRU payload accounting still describes only
+  // retained cache entries; evicted tables can live until this pass returns.
+  std::vector<std::shared_ptr<PhysicalSummaryTable>> physical_tables_in_pass;
   if (++support_epoch_ == 0) {
     for (SupportWorkingMemory& memory : support_working_memory_) {
       memory.epoch = 0;
@@ -3276,6 +5206,7 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
       memory.entry.candidate_cost =
           std::numeric_limits<double>::infinity();
       memory.entry.move.change_count = 0;
+      memory.physical_summaries = nullptr;
     }
     return memory;
   };
@@ -3306,7 +5237,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
                       .route_indices = {},
                       .route_versions = {},
                       .route_count = 1,
-                      .opens_route = opens_route};
+                      .opens_route = opens_route,
+                      .physical_customer_mode = physical_reverse_mode || physical_relocate_mode};
     key.route_indices[0] = first;
     key.route_versions[0] = current_route_versions[first];
     if (second.has_value()) {
@@ -3328,7 +5260,9 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     SupportWorkingMemory& memory = support_memory(index);
     if (memory.state == SupportState::Unknown) {
       MoveMemoryKey key = support_key(first, second, opens_route);
-      if (auto cached = move_memory_.get(key); cached.has_value()) {
+      const auto cached = move_memory_usable_
+          ? move_memory_.get(key) : std::nullopt;
+      if (cached.has_value()) {
         memory.active = true;
         memory.key = std::move(key);
         memory.entry = std::move(*cached);
@@ -3373,10 +5307,175 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     std::size_t route{};
     std::size_t customer_slot{};
   };
-  std::vector<std::optional<RouteCostSummary>> relocate_source_summaries(
+  std::vector<std::optional<PhysicalScoreSummary>> relocate_source_summaries(
       neighborhood == Neighborhood::Relocate ? customer_count : 0);
-  auto consider_move = [&](MoveDescriptor move,
-                           std::optional<ReusableRelocateSource> reusable) {
+  const auto physical_table = [&](SupportWorkingMemory& memory,
+                                  const MoveSupport& support)
+      -> PhysicalSummaryTable* {
+    if (physical_ids[support.first] == 0 ||
+        (support.second.has_value() && physical_ids[*support.second] == 0)) {
+      return nullptr;
+    }
+    if (memory.physical_summaries != nullptr) return memory.physical_summaries;
+    const PhysicalSupportKey key{
+        .neighborhood = neighborhood,
+        .routes = {physical_ids[support.first],
+                   support.second.has_value() ? physical_ids[*support.second] : 0},
+        .opens_route = support.opens_route,
+        .physical_customer_mode = physical_reverse_mode || physical_relocate_mode};
+    if (auto cached = physical_summaries_.get(key); cached.has_value()) {
+      physical_tables_in_pass.push_back(std::move(*cached));
+      memory.physical_summaries = physical_tables_in_pass.back().get();
+      return memory.physical_summaries;
+    }
+    const std::size_t first_size = current[support.first].size();
+    const std::size_t second_size = support.second.has_value()
+        ? current[*support.second].size() : first_size;
+    std::size_t row_count{};
+    if (neighborhood == Neighborhood::Swap) {
+      row_count = first_size * second_size;
+    } else if (neighborhood == Neighborhood::Relocate) {
+      row_count = support.opens_route ? first_size
+          : support.second.has_value()
+              ? first_size * (second_size + 1) + second_size * (first_size + 1)
+              : first_size * (first_size + 1);
+    } else {
+      row_count = 2 * (first_size + 1) * (second_size + 1) +
+          static_cast<std::size_t>(physical_reverse_mode);
+    }
+    const std::size_t bytes = row_count * sizeof(PhysicalSummaryRow);
+    if (bytes == 0 || bytes > physical_summary_budget_) return nullptr;
+    while (physical_summary_bytes_ + bytes > physical_summary_budget_ ||
+           physical_summaries_.size() == physical_summaries_.capacity()) {
+      auto evicted = physical_summaries_.discard_oldest();
+      if (!evicted.has_value()) break;
+      physical_summary_bytes_ -= (*evicted)->rows.size() * sizeof(PhysicalSummaryRow);
+    }
+    auto table = std::make_shared<PhysicalSummaryTable>();
+    table->rows.resize(row_count);
+    physical_summary_bytes_ += bytes;
+    physical_summaries_.put(key, table);
+    statistics_.physical_summary_cache_groups = physical_summaries_.size();
+    statistics_.physical_summary_cache_bytes = physical_summary_bytes_;
+    statistics_.physical_summary_cache_peak_bytes = std::max(
+        statistics_.physical_summary_cache_peak_bytes,
+        static_cast<std::uint64_t>(physical_summary_bytes_));
+    statistics_.physical_summary_cache_evictions = physical_summaries_.evictions();
+    physical_tables_in_pass.push_back(std::move(table));
+    memory.physical_summaries = physical_tables_in_pass.back().get();
+    return memory.physical_summaries;
+  };
+  NonlinearSequenceEvaluator opening_evaluator(instance_);
+  // Profiles live only in this neighborhood pass. A later accepted move gets
+  // fresh directional labels; no lambda-dependent score is stored here.
+  std::vector<std::unique_ptr<PhysicalReverseTwoOptProfile>> two_opt_profiles(
+      physical_reverse_mode ? route_count : 0);
+  const auto physical_two_opt_profile = [&](std::size_t route)
+      -> const PhysicalReverseTwoOptProfile& {
+    auto& profile = two_opt_profiles.at(route);
+    if (!profile) profile = std::make_unique<PhysicalReverseTwoOptProfile>(
+        instance_, solution.plans.at(route), opening_evaluator);
+    return *profile;
+  };
+  // Reuse only accumulator storage within this sequential neighborhood pass.
+  // The first initialized append copy-assigns every field before any use.
+  ChargingSequenceLabel physical_two_opt_scratch;
+  const auto physical_two_opt_score = [&](const MoveDescriptor& move,
+                                          std::size_t child) {
+    ChargingSequenceLabel& label = physical_two_opt_scratch;
+    label.initialized = false;
+    int previous = instance_.depot().id;
+    if (move.physical_forward_two_opt) {
+      // Child 0 is A-prefix + B-suffix; child 1 is B-prefix + A-suffix.
+      // Ordinary cut n stays before the parent's trailing station chain.
+      physical_two_opt_profile(move.changes[child].route).append_label(
+          move.two_opt_cuts[child], true, false,
+          label, previous, opening_evaluator);
+      physical_two_opt_profile(move.changes[1 - child].route).append_label(
+          move.two_opt_cuts[1 - child], false, false,
+          label, previous, opening_evaluator);
+    } else {
+      physical_two_opt_profile(move.changes[0].route).append_label(
+          move.two_opt_cuts[0], child == 0, child == 1,
+          label, previous, opening_evaluator);
+      physical_two_opt_profile(move.changes[1].route).append_label(
+          move.two_opt_cuts[1], child == 0, child == 0,
+          label, previous, opening_evaluator);
+    }
+    opening_evaluator.append(label, opening_evaluator.edge_label(
+        previous, {}, instance_.depot().id));
+    return opening_evaluator.evaluate(label);
+  };
+  const auto physical_two_opt_visits = [&](const MoveDescriptor& move,
+                                           std::size_t child) {
+    std::vector<int> visits;
+    if (move.physical_forward_two_opt) {
+      physical_two_opt_profile(move.changes[child].route).append_visits(
+          move.two_opt_cuts[child], true, false, visits);
+      physical_two_opt_profile(move.changes[1 - child].route).append_visits(
+          move.two_opt_cuts[1 - child], false, false, visits);
+    } else {
+      physical_two_opt_profile(move.changes[0].route).append_visits(
+          move.two_opt_cuts[0], child == 0, child == 1, visits);
+      physical_two_opt_profile(move.changes[1].route).append_visits(
+          move.two_opt_cuts[1], child == 0, child == 0, visits);
+    }
+    return visits;
+  };
+  const bool physical_swap = preserve_swap_station_visits_ &&
+                             neighborhood == Neighborhood::Swap;
+  const bool paper_two_opt = profile_ == SearchProfile::Paper &&
+                             neighborhood == Neighborhood::TwoOptStar;
+  // Reuse the immutable Instance certificate; only the FP environment and
+  // lambda domain need checking in this pass. Timed calls keep full scoring.
+  // Physical 2OPT children partition the two parents' physical fragments.
+  // The existing support certificate bounds every child by their combined
+  // visits/station occurrences, so its generalized cost is also nonnegative.
+  const bool exact_child_rejection_supported =
+      (physical_swap || paper_two_opt) &&
+      !deadline.has_value() && &path_sampler_.instance_ == &instance_ &&
+      path_sampler_.replacement_summary_statistics().bound_certified &&
+      supported_bound_fp_environment() &&
+      nonlinear_travel_bound(0.0, 0.0, 0, instance_.vehicle(),
+                             penalty_lambda).has_value();
+  // Construct a route profile only on a physical-summary miss. Reuse it while
+  // this route slot's entire physical sequence is unchanged, including CS.
+  const auto swap_profile = [&](std::size_t route) -> SwapPhysicalProfile& {
+    if (swap_profiles_.size() != route_count) swap_profiles_.resize(route_count);
+    auto& profile = swap_profiles_.at(route);
+    const Plan& plan = solution.plans.at(route);
+    if (!profile.scorer || profile.visits != plan.route.visits) {
+      SwapPhysicalProfile fresh;
+      fresh.visits = plan.route.visits;
+      for (std::size_t slot = 0; slot < fresh.visits.size(); ++slot) {
+        if (instance_.node(fresh.visits[slot]).kind == NodeKind::Customer) {
+          fresh.customer_slots.push_back(slot);
+        }
+      }
+      fresh.scorer = std::make_unique<PhysicalRouteScorer>(instance_, plan, true);
+      profile = std::move(fresh);
+    }
+    return profile;
+  };
+  const auto mark_physical_relocate = [&](std::size_t source_route,
+                                           std::size_t source_position,
+                                           std::size_t target_route,
+                                           std::size_t customer_gap) {
+    if (!physical_relocate_mode || target_route == route_count) return;
+    candidate_move.physical_relocate = true;
+    candidate_move.relocate_source_route = source_route;
+    candidate_move.relocate_target_route = target_route;
+    candidate_move.relocate_source_position =
+        swap_profile(source_route).customer_slots.at(source_position);
+    // Keep the original Gamma/customer-gap list. Only its physical realization
+    // changes: insert immediately after the predecessor, before the CS chain.
+    candidate_move.relocate_target_slot = customer_gap == 0 ? 0
+        : swap_profile(target_route).customer_slots.at(customer_gap - 1) + 1;
+  };
+  auto consider_move = [&](const MoveDescriptor& move,
+                           std::optional<ReusableRelocateSource> reusable,
+                           std::size_t physical_row,
+                           bool operator_allowed) {
     ++statistics_.descriptors_considered;
     if (expired(deadline)) return;
     const MoveSupport support = move_support(move);
@@ -3396,32 +5495,139 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
           support_key(support.first, support.second, support.opens_route);
       ++statistics_.route_support_groups;
     }
-    if (!move_allowed(move)) {
+    if (!operator_allowed) {
       ++statistics_.granular_rejections;
       return;
     }
 
+    const auto table = physical_table(memory, support);
+    PhysicalSummaryRow* row = table ? &table->rows.at(physical_row) : nullptr;
+    // Literal existing-route Relocate does not alter projected opening.
+    const bool projected_opening =
+        project_opening_station_visits_ && support.opens_route;
+    const auto evaluate_physical = [&](std::size_t index,
+                                       std::span<const IncumbentRouteSlice> slices) {
+      const unsigned char bit = static_cast<unsigned char>(1U << index);
+      if (row != nullptr && (row->valid & bit) != 0) {
+        ++statistics_.physical_summary_hits;
+        return row->summaries[index];
+      }
+      ++statistics_.physical_summary_misses;
+      const RouteCostSummary evaluated = [&]() {
+        if (move.physical_reverse_two_opt || move.physical_forward_two_opt)
+          return physical_two_opt_score(move, index);
+        if (move.physical_relocate) {
+          auto& source_profile = swap_profile(move.relocate_source_route);
+          if (move.relocate_source_route == move.relocate_target_route) {
+            return source_profile.scorer->evaluate_relocate(
+                move.relocate_source_position, move.relocate_target_slot);
+          }
+          if (move.changes[index].route == move.relocate_source_route) {
+            return source_profile.scorer->evaluate_removal(move.relocate_source_position);
+          }
+          return swap_profile(move.relocate_target_route).scorer->evaluate_insertion(
+              move.relocate_target_slot,
+              source_profile.visits.at(move.relocate_source_position));
+        }
+        if (physical_swap) {
+          if (!support.second.has_value()) {
+            auto& profile = swap_profile(support.first);
+            const std::size_t size = current[support.first].size();
+            return profile.scorer->evaluate_swap(
+                profile.customer_slots.at(physical_row / size),
+                profile.customer_slots.at(physical_row % size));
+          }
+          const std::size_t second = *support.second;
+          const std::size_t width = current[second].size();
+          const std::size_t first_position = physical_row / width;
+          const std::size_t second_position = physical_row % width;
+          const bool first_child = move.changes[index].route == support.first;
+          const std::size_t route = first_child ? support.first : second;
+          auto& profile = swap_profile(route);
+          return profile.scorer->evaluate_replacement(
+              profile.customer_slots.at(first_child ? first_position : second_position),
+              first_child ? current[second][second_position]
+                          : current[support.first][first_position]);
+        }
+        return projected_opening
+            ? opening_evaluator.evaluate(opening_evaluator.route_label(Route{
+                  project_opening_visits(
+                      instance_, solution.plans[support.first],
+                      current[support.first][physical_row],
+                      move.changes[index].route == route_count)}))
+            : ensure_sequence_scorer().evaluate(slices);
+      }();
+      const PhysicalScoreSummary summary(evaluated);
+      if (row != nullptr) {
+        row->summaries[index] = summary;
+        row->valid |= bit;
+      }
+      return summary;
+    };
     double candidate_cost = 0.0;
     for (std::size_t index = 0; index < move.change_count; ++index) {
       const DescribedRouteChange& change = move.changes[index];
       if (change.slice_count == 0) continue;
+      // Child 0 has already been scored and cached exactly in the original
+      // order. Never skip a child-1 row hit or publish a bound as an exact row.
+      if (index == 1 && row != nullptr && (row->valid & 2U) == 0 &&
+          exact_child_rejection_supported && support.second.has_value() &&
+          !support.opens_route && move.change_count == 2 &&
+          move.changes[0].slice_count != 0 &&
+          physical_ids[support.first] != 0 &&
+          physical_ids[*support.second] != 0 &&
+          std::isfinite(candidate_cost) && candidate_cost >= 0.0 &&
+          std::isfinite(memory.entry.candidate_cost) &&
+          memory.entry.candidate_cost >= 0.0 &&
+          candidate_cost > memory.entry.candidate_cost &&
+          candidate_cost - memory.entry.candidate_cost > kCostTolerance) {
+        // 2OPT's support bit certifies both children using the combined
+        // parent domain. Keep its sequence scorer separate from Swap.
+        if (paper_two_opt &&
+            (customer_open_support_flags_[support.first * route_count +
+                                           *support.second] & 2U) != 0) {
+          return;
+        }
+        const auto& first = solution.plans[support.first];
+        const auto& second = solution.plans[*support.second];
+        // Canonical physical IDs bound each source to 256 visits. Replacement
+        // preserves its station count; keep both kernels in the certified
+        // inline domain and skip only a second child with charging work.
+        if (physical_swap &&
+            first.route.visits.size() >= first.customer_ids.size() &&
+            first.route.visits.size() - first.customer_ids.size() <= 62 &&
+            second.route.visits.size() > second.customer_ids.size() &&
+            second.route.visits.size() - second.customer_ids.size() <= 62) {
+          // Certified C1 >= 0 implies fl(C0 + C1) >= C0. This exact positive
+          // C0-B difference excludes both improvement and tolerance ties.
+          return;
+        }
+      }
       const auto slices = std::span<const IncumbentRouteSlice>{
           change.slices.data(), change.slice_count};
-      if (reusable.has_value() && change.route == reusable->route) {
+      // The legacy deletion memo drops newly joined station paths. It cannot
+      // supply the projected source, whose visits retain those same stations.
+      // Its separate opening-support physical row still caches the new result.
+      if (!projected_opening && reusable.has_value() &&
+          change.route == reusable->route) {
         auto& summary =
             relocate_source_summaries.at(reusable->customer_slot);
         if (!summary.has_value()) {
-          summary = scorer.evaluate(slices);
+          summary = evaluate_physical(index, slices);
           ++statistics_.slice_routes_evaluated;
           ++statistics_.relocate_source_summary_misses;
         } else {
           ++statistics_.relocate_source_summary_hits;
+          if (row != nullptr) {
+            row->summaries[index] = *summary;
+            row->valid |= static_cast<unsigned char>(1U << index);
+          }
         }
-        candidate_cost +=
-            generalized_cost(*summary, instance_, penalty_lambda);
+        candidate_cost += summary->generalized_cost(instance_, penalty_lambda);
       } else {
         ++statistics_.slice_routes_evaluated;
-        candidate_cost += scorer.generalized_cost(slices, penalty_lambda);
+        candidate_cost += evaluate_physical(index, slices).generalized_cost(
+            instance_, penalty_lambda);
       }
     }
     ++statistics_.moves_evaluated;
@@ -3430,94 +5636,142 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
              kCostTolerance &&
          move_less(move, memory.entry.move))) {
       memory.entry = MoveMemoryEntry{.candidate_cost = candidate_cost,
-                                     .move = std::move(move)};
+                                     .move = move};
     }
   };
-  const auto consider = [&](MoveDescriptor move) {
-    consider_move(std::move(move), std::nullopt);
+  const auto consider = [&](std::size_t physical_row,
+                             bool operator_allowed) {
+    consider_move(candidate_move, std::nullopt, physical_row, operator_allowed);
   };
 
   if (neighborhood == Neighborhood::Swap) {
     std::vector<std::pair<int, int>>& customer_pairs = swap_customer_pairs_;
     customer_pairs.clear();
     customer_pairs.reserve(granular_.promising_pairs().size() * 4);
-    const auto generate_swap_bucket = [&](std::size_t first_route,
-                                          std::size_t second_route) {
-      const auto add_from_route = [&](std::size_t source_route,
-                                      std::size_t target_route) {
-        for (std::size_t position = 0;
-             position < current[source_route].size(); ++position) {
-          const int candidate_customer = current[source_route][position];
-          const auto add_from_adjacent = [&](int adjacent_customer) {
-            for (const int promising_customer :
-                 granular_.promising_neighbors_of(adjacent_customer)) {
-              if (customer_location(promising_customer).route != target_route ||
-                  candidate_customer == promising_customer) {
-                continue;
-              }
-              customer_pairs.push_back(
-                  std::minmax(candidate_customer, promising_customer));
-            }
-          };
-          if (position > 0) {
-            add_from_adjacent(current[source_route][position - 1]);
-          }
-          if (position + 1 < current[source_route].size()) {
-            add_from_adjacent(current[source_route][position + 1]);
-          }
-        }
-      };
-      add_from_route(first_route, second_route);
-      if (first_route != second_route) {
-        add_from_route(second_route, first_route);
-      }
-    };
+    if (route_count != 0 &&
+        route_count > customer_open_support_flags_.max_size() / route_count) {
+      throw std::length_error("Swap support workspace is too large");
+    }
+    customer_open_support_flags_.assign(route_count * route_count, 0);
+    // Keep the original support-memory lookup order, including closed hits.
+    // A promising neighbor already identifies its target route; do not scan
+    // the same source list again for every open target route.
     for (std::size_t first_route = 0; first_route < route_count;
          ++first_route) {
       if (!support_is_closed(first_route, std::nullopt, false)) {
-        generate_swap_bucket(first_route, first_route);
+        customer_open_support_flags_[first_route * route_count + first_route] = 1;
       }
       for (std::size_t second_route = first_route + 1;
            second_route < route_count; ++second_route) {
         if (!support_is_closed(first_route, second_route, false)) {
-          generate_swap_bucket(first_route, second_route);
+          customer_open_support_flags_[first_route * route_count + second_route] = 1;
+          customer_open_support_flags_[second_route * route_count + first_route] = 1;
         }
       }
     }
-    std::sort(customer_pairs.begin(), customer_pairs.end());
-    customer_pairs.erase(
-        std::unique(customer_pairs.begin(), customer_pairs.end()),
-        customer_pairs.end());
+    const auto& customers = instance_.customer_ids();
+    bool numeric_order = true;
+    for (std::size_t i = 0; i < customers.size(); ++i) {
+      if (customers[i] != static_cast<int>(i + 1)) {
+        numeric_order = false;
+        break;
+      }
+    }
+    if (numeric_order) {
+      if (!customers.empty() &&
+          customers.size() > swap_order_flags_.max_size() / customers.size()) {
+        throw std::length_error("Swap ordering workspace is too large");
+      }
+      swap_order_flags_.assign(customers.size() * customers.size(), 0);
+    }
+    for (std::size_t source_route = 0; source_route < route_count;
+         ++source_route) {
+      const auto open = customer_open_support_flags_.begin() +
+                        source_route * route_count;
+      if (std::none_of(open, open + route_count,
+                       [](unsigned char flag) { return flag != 0; })) continue;
+      for (std::size_t position = 0;
+           position < current[source_route].size(); ++position) {
+        const int candidate_customer = current[source_route][position];
+        const auto add_from_adjacent = [&](int adjacent_customer) {
+          for (const int promising_customer :
+               granular_.promising_neighbors_of(adjacent_customer)) {
+            const auto target_route = customer_location(promising_customer).route;
+            if (!open[target_route] || candidate_customer == promising_customer) {
+              continue;
+            }
+            const auto [left, right] =
+                std::minmax(candidate_customer, promising_customer);
+            if (numeric_order) {
+              swap_order_flags_[(static_cast<std::size_t>(left) - 1) *
+                                    customers.size() +
+                                static_cast<std::size_t>(right) - 1] = 1;
+            } else {
+              customer_pairs.emplace_back(left, right);
+            }
+          }
+        };
+        if (position > 0) {
+          add_from_adjacent(current[source_route][position - 1]);
+        }
+        if (position + 1 < current[source_route].size()) {
+          add_from_adjacent(current[source_route][position + 1]);
+        }
+      }
+    }
+    if (numeric_order) {
+      // The upper-triangle scan is exactly sort+unique on numeric ID pairs.
+      for (std::size_t left = 0; left < customers.size(); ++left) {
+        for (std::size_t right = left + 1; right < customers.size(); ++right) {
+          if (swap_order_flags_[left * customers.size() + right]) {
+            customer_pairs.emplace_back(customers[left], customers[right]);
+          }
+        }
+      }
+    } else {
+      std::sort(customer_pairs.begin(), customer_pairs.end());
+      customer_pairs.erase(
+          std::unique(customer_pairs.begin(), customer_pairs.end()),
+          customer_pairs.end());
+    }
     for (const auto& [left_customer, right_customer] : customer_pairs) {
       const CustomerLocation left = customer_location(left_customer);
       const CustomerLocation right = customer_location(right_customer);
+      // Correlated sets contain customers only. A depot predecessor contributes
+      // no qualifying arc; the other entry can still qualify the Swap.
+      const bool entry_allowed =
+          (left.position > 0 && granular_.promising_by_rank(
+              current_ranks[left.route][left.position - 1], right.customer_slot)) ||
+          (right.position > 0 && granular_.promising_by_rank(
+              current_ranks[right.route][right.position - 1], left.customer_slot));
       if (left.route == right.route) {
         const std::size_t low = std::min(left.position, right.position);
         const std::size_t high = std::max(left.position, right.position);
         if (high < low + 2) continue;
-        DescribedRouteChange changed{.route = left.route};
+        auto& changed = one_change(left.route);
         add_slice(changed, left.route, 0, low);
         add_slice(changed, left.route, high, high + 1);
         add_slice(changed, left.route, low + 1, high);
         add_slice(changed, left.route, low, low + 1);
         add_slice(changed, left.route, high + 1,
                   current[left.route].size());
-        consider(one_change(std::move(changed)));
+        consider(low * current[left.route].size() + high, entry_allowed);
       } else {
-        DescribedRouteChange changed_left{.route = left.route};
+        auto [changed_left, changed_right] = two_changes(left.route, right.route);
         add_slice(changed_left, left.route, 0, left.position);
         add_slice(changed_left, right.route, right.position,
                   right.position + 1);
         add_slice(changed_left, left.route, left.position + 1,
                   current[left.route].size());
-        DescribedRouteChange changed_right{.route = right.route};
         add_slice(changed_right, right.route, 0, right.position);
         add_slice(changed_right, left.route, left.position,
                   left.position + 1);
         add_slice(changed_right, right.route, right.position + 1,
                   current[right.route].size());
-        consider(two_changes(std::move(changed_left),
-                             std::move(changed_right)));
+        const auto& lower = left.route < right.route ? left : right;
+        const auto& upper = left.route < right.route ? right : left;
+        consider(lower.position * current[upper.route].size() + upper.position,
+                 entry_allowed);
       }
     }
   } else if (neighborhood == Neighborhood::Relocate) {
@@ -3526,22 +5780,16 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     moves.clear();
     moves.reserve(instance_.customer_ids().size() *
                   (4 * granular_.gamma_size() + 1));
-    const auto generate_relocate_bucket = [&](std::size_t source_route,
-                                              std::size_t target_route) {
-      for (const int customer : current[source_route]) {
-        for (const int neighbor :
-             granular_.promising_neighbors_of(customer)) {
-          const CustomerLocation target = customer_location(neighbor);
-          if (target.route != target_route) continue;
-          moves.emplace_back(customer, target_route, target.position);
-          moves.emplace_back(customer, target_route, target.position + 1);
-        }
-      }
-    };
+    if (route_count != 0 &&
+        route_count > customer_open_support_flags_.max_size() / route_count) {
+      throw std::length_error("Relocate support workspace is too large");
+    }
+    customer_open_support_flags_.assign(route_count * route_count, 0);
+    // Preserve intra/opening/pair memory queries in their original order.
     for (std::size_t first_route = 0; first_route < route_count;
          ++first_route) {
       if (!support_is_closed(first_route, std::nullopt, false)) {
-        generate_relocate_bucket(first_route, first_route);
+        customer_open_support_flags_[first_route * route_count + first_route] = 1;
       }
       if (current[first_route].size() > 1 &&
           !support_is_closed(first_route, std::nullopt, true)) {
@@ -3552,19 +5800,49 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
       for (std::size_t second_route = first_route + 1;
            second_route < route_count; ++second_route) {
         if (support_is_closed(first_route, second_route, false)) continue;
-        generate_relocate_bucket(first_route, second_route);
-        generate_relocate_bucket(second_route, first_route);
+        customer_open_support_flags_[first_route * route_count + second_route] = 1;
+        customer_open_support_flags_[second_route * route_count + first_route] = 1;
       }
     }
-    std::sort(moves.begin(), moves.end());
-    moves.erase(std::unique(moves.begin(), moves.end()), moves.end());
+    for (std::size_t source_route = 0; source_route < route_count;
+         ++source_route) {
+      const auto open = customer_open_support_flags_.begin() +
+                        source_route * route_count;
+      if (std::none_of(open, open + route_count,
+                       [](unsigned char flag) { return flag != 0; })) continue;
+      for (const int customer : current[source_route]) {
+        // N1 qualifies the incoming destination arc, not source closure.
+        for (const int neighbor : granular_.promising_neighbors_of(customer)) {
+          const CustomerLocation target = customer_location(neighbor);
+          if (!open[target.route] ||
+              !granular_.promising(neighbor, customer)) continue;
+          moves.emplace_back(customer, target.route, target.position + 1);
+        }
+      }
+    }
+    order_relocate_moves(current);
     for (const auto& [customer, target_route, original_gap] : moves) {
       const CustomerLocation source = customer_location(customer);
+      // HLNS permits Relocate to open a route. An empty destination has no
+      // customer entry arc on which Gamma is defined; keep this structural
+      // case separate from the unchanged existing-route entry restriction.
+      // This boundary interpretation is recorded in audit 5.15.
+      const bool entry_allowed = target_route == route_count ||
+          (original_gap > 0 && granular_.promising_by_rank(
+              current_ranks[target_route][original_gap - 1], source.customer_slot));
       if (target_route == source.route) {
         std::size_t insertion = original_gap;
         if (source.position < original_gap) --insertion;
-        if (insertion == source.position) continue;
-        DescribedRouteChange changed{.route = source.route};
+        if (physical_relocate_mode) {
+          const auto& slots = swap_profile(source.route).customer_slots;
+          const std::size_t p = slots.at(source.position);
+          const std::size_t q = original_gap == 0 ? 0 : slots.at(original_gap - 1) + 1;
+          // Customer-order no-ops can move a customer across an existing CS.
+          if (q - static_cast<std::size_t>(p < q) == p) continue;
+        } else if (insertion == source.position) {
+          continue;
+        }
+        auto& changed = one_change(source.route);
         if (source.position < insertion) {
           add_slice(changed, source.route, 0, source.position);
           add_slice(changed, source.route, source.position + 1,
@@ -3581,34 +5859,43 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
           add_slice(changed, source.route, source.position + 1,
                     current[source.route].size());
         }
-        consider(one_change(std::move(changed)));
+        mark_physical_relocate(source.route, source.position, target_route, original_gap);
+        consider(source.position * (current[source.route].size() + 1) + original_gap,
+                 entry_allowed);
       } else if (target_route == current.size()) {
-        DescribedRouteChange changed_source{.route = source.route};
+        auto [changed_source, singleton] = two_changes(source.route, current.size());
         add_slice(changed_source, source.route, 0, source.position);
         add_slice(changed_source, source.route, source.position + 1,
                   current[source.route].size());
-        DescribedRouteChange singleton{.route = current.size()};
         add_slice(singleton, source.route, source.position,
                   source.position + 1);
         consider_move(
-            two_changes(std::move(changed_source), std::move(singleton)),
+            candidate_move,
             ReusableRelocateSource{.route = source.route,
-                                   .customer_slot = source.customer_slot});
+                                   .customer_slot = source.customer_slot},
+            source.position, entry_allowed);
       } else {
-        DescribedRouteChange changed_source{.route = source.route};
+        auto [changed_source, changed_target] = two_changes(source.route, target_route);
         add_slice(changed_source, source.route, 0, source.position);
         add_slice(changed_source, source.route, source.position + 1,
                   current[source.route].size());
-        DescribedRouteChange changed_target{.route = target_route};
         add_slice(changed_target, target_route, 0, original_gap);
         add_slice(changed_target, source.route, source.position,
                   source.position + 1);
         add_slice(changed_target, target_route, original_gap,
                   current[target_route].size());
+        mark_physical_relocate(source.route, source.position, target_route, original_gap);
+        const std::size_t lower_route = std::min(source.route, target_route);
+        const std::size_t upper_route = std::max(source.route, target_route);
+        const std::size_t physical_row = source.route == lower_route
+            ? source.position * (current[upper_route].size() + 1) + original_gap
+            : current[lower_route].size() * (current[upper_route].size() + 1) +
+                source.position * (current[lower_route].size() + 1) + original_gap;
         consider_move(
-            two_changes(std::move(changed_source), std::move(changed_target)),
+            candidate_move,
             ReusableRelocateSource{.route = source.route,
-                                   .customer_slot = source.customer_slot});
+                                   .customer_slot = source.customer_slot}, physical_row,
+            entry_allowed);
       }
     }
   } else if (neighborhood == Neighborhood::TwoOptStar) {
@@ -3618,39 +5905,103 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     moves.clear();
     moves.reserve(granular_.promising_pairs().size() * 4 +
                   current.size() * (current.size() - 1) / 2);
+    if (route_count != 0 &&
+        route_count > customer_open_support_flags_.max_size() / route_count) {
+      throw std::length_error("2OPT support workspace is too large");
+    }
+    customer_open_support_flags_.assign(route_count * route_count, 0);
     for (std::size_t left_route = 0; left_route < current.size(); ++left_route) {
       for (std::size_t right_route = left_route + 1;
            right_route < current.size(); ++right_route) {
         if (support_is_closed(left_route, right_route, false)) continue;
-        for (std::size_t left_position = 0;
-             left_position < current[left_route].size(); ++left_position) {
-          const int left_customer = current[left_route][left_position];
-          for (const int right_customer :
-               granular_.promising_neighbors_of(left_customer)) {
-            const CustomerLocation right =
-                customer_location(right_customer);
-            if (right.route != right_route) continue;
-            moves.emplace_back(left_route, right_route, left_position + 1,
-                               right.position, false);
-            moves.emplace_back(left_route, right_route, left_position,
-                               right.position + 1, false);
-            moves.emplace_back(left_route, right_route, left_position + 1,
-                               right.position + 1, true);
-            moves.emplace_back(left_route, right_route, left_position,
-                               right.position, true);
-          }
+        auto& flags =
+            customer_open_support_flags_[left_route * route_count + right_route];
+        flags = 1;
+        if (!ILS_SP_FORWARD_ONLY_TWO_OPT && physical_reverse_mode &&
+            !current[left_route].empty() &&
+            !current[right_route].empty()) {
+          // Complete the departure/return-depot boundary coverage of the
+          // existing reverse inter-route reconnection. The new arcs have no
+          // customer/customer pair for Gamma to qualify. Each child remains
+          // nonempty: reverse(B), reverse(A), with every physical visit kept.
+          // The opposite true-end case yields A,B unchanged and is omitted.
+          auto [changed_left, changed_right] = two_changes(left_route, right_route);
+          candidate_move.physical_reverse_two_opt = true;
+          candidate_move.two_opt_cuts = {0, current[right_route].size() + 1};
+          add_slice(changed_left, right_route, 0, current[right_route].size(), true);
+          add_slice(changed_right, left_route, 0, current[left_route].size(), true);
+          // Dedicated row: do not alias generic customer cut (0,n), whose
+          // physical boundary precedes trailing stations. Role order remains
+          // the support's ordered route slots in both summaries and winner.
+          consider(2 * (current[left_route].size() + 1) *
+                       (current[right_route].size() + 1), true);
         }
-        moves.emplace_back(left_route, right_route, 0,
-                           current[right_route].size(), true);
+        if (!exact_child_rejection_supported || physical_ids[left_route] == 0 ||
+            physical_ids[right_route] == 0) continue;
+        const auto& left = solution.plans[left_route];
+        const auto& right = solution.plans[right_route];
+        const std::size_t left_visits = left.route.visits.size();
+        const std::size_t right_visits = right.route.visits.size();
+        if (left.customer_ids.empty() || right.customer_ids.empty() ||
+            left_visits < left.customer_ids.size() ||
+            right_visits < right.customer_ids.size() ||
+            left_visits > 256 || right_visits > 256 - left_visits) continue;
+        const std::size_t left_stations = left_visits - left.customer_ids.size();
+        const std::size_t right_stations = right_visits - right.customer_ids.size();
+        // Every child's inherited stations are a subset of these two parents;
+        // reversed internal edges are direct. Bound occurrences, not IDs.
+        if (left_stations <= 62 && right_stations <= 62 - left_stations &&
+            (left_stations != 0 || right_stations != 0)) flags = 3;
       }
     }
-    std::sort(moves.begin(), moves.end());
-    moves.erase(std::unique(moves.begin(), moves.end()), moves.end());
+    for (std::size_t left_route = 0; left_route < route_count; ++left_route) {
+      const auto open = customer_open_support_flags_.begin() +
+                        left_route * route_count;
+      if (std::none_of(open + left_route + 1, open + route_count,
+                       [](unsigned char flag) { return flag != 0; })) continue;
+      for (std::size_t left_position = 0;
+           left_position < current[left_route].size(); ++left_position) {
+        const int left_customer = current[left_route][left_position];
+        for (const int right_customer :
+             granular_.promising_neighbors_of(left_customer)) {
+          const CustomerLocation right = customer_location(right_customer);
+          if (right.route <= left_route || !open[right.route]) continue;
+          moves.emplace_back(left_route, right.route, left_position + 1,
+                             right.position, false);
+          moves.emplace_back(left_route, right.route, left_position,
+                             right.position + 1, false);
+#if !ILS_SP_FORWARD_ONLY_TWO_OPT
+          moves.emplace_back(left_route, right.route, left_position + 1,
+                             right.position + 1, true);
+          moves.emplace_back(left_route, right.route, left_position,
+                             right.position, true);
+#endif
+        }
+      }
+    }
+    order_two_opt_moves(current);
     for (const auto& [left_route, right_route, left_cut, right_cut,
                       reverse_reconnection] : moves) {
-      DescribedRouteChange changed_left{.route = left_route};
-      DescribedRouteChange changed_right{.route = right_route};
+      const auto& left = current_ranks[left_route];
+      const auto& right = current_ranks[right_route];
+      // Check the actual two directed reconnections. Reversed internal arcs
+      // cannot qualify a move whose reconnection arcs are both unpromising.
+      const bool entry_allowed = !reverse_reconnection
+          ? ((left_cut > 0 && right_cut < right.size() &&
+              granular_.promising_by_rank(left[left_cut - 1], right[right_cut])) ||
+             (right_cut > 0 && left_cut < left.size() &&
+              granular_.promising_by_rank(right[right_cut - 1], left[left_cut])))
+          : ((left_cut > 0 && right_cut > 0 &&
+              granular_.promising_by_rank(left[left_cut - 1], right[right_cut - 1])) ||
+             (left_cut < left.size() && right_cut < right.size() &&
+              granular_.promising_by_rank(left[left_cut], right[right_cut])));
+      auto [changed_left, changed_right] = two_changes(left_route, right_route);
       if (!reverse_reconnection) {
+        candidate_move.physical_forward_two_opt = physical_reverse_mode;
+        candidate_move.two_opt_cuts = {left_cut, right_cut};
+        // A customer-empty child is an unused vehicle: its station-only tour
+        // contributes zero (empty slices) and is not materialized. The other
+        // child's physical prefix/suffix, including CS visits, stays intact.
         add_slice(changed_left, left_route, 0, left_cut);
         add_slice(changed_left, right_route, right_cut,
                   current[right_route].size());
@@ -3658,6 +6009,20 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
         add_slice(changed_right, left_route, left_cut,
                   current[left_route].size());
       } else {
+#if ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD
+        // Use the same physical cuts for reverse route closure as for every
+        // other reconnection. Empty customer slices contribute zero and are
+        // not materialized; the productive child keeps its physical fragments.
+        candidate_move.physical_reverse_two_opt = physical_reverse_mode;
+#else
+        // Empty-customer children retain the existing legacy behavior. For
+        // nonempty children, explicit cuts also retain station-only physical
+        // fragments that are absent from the customer-slice descriptor.
+        candidate_move.physical_reverse_two_opt = physical_reverse_mode &&
+            left_cut + right_cut != 0 &&
+            left_cut + right_cut != left.size() + right.size();
+#endif
+        candidate_move.two_opt_cuts = {left_cut, right_cut};
         add_slice(changed_left, left_route, 0, left_cut);
         add_slice(changed_left, right_route, 0, right_cut, true);
         add_slice(changed_right, left_route, left_cut,
@@ -3665,8 +6030,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
         add_slice(changed_right, right_route, right_cut,
                   current[right_route].size());
       }
-      consider(two_changes(std::move(changed_left),
-                           std::move(changed_right)));
+      consider(2 * (left_cut * (current[right_route].size() + 1) + right_cut) +
+                   static_cast<std::size_t>(reverse_reconnection), entry_allowed);
     }
   }
 
@@ -3676,7 +6041,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   for (std::size_t support = 0; support < support_count; ++support) {
     SupportWorkingMemory& memory = support_working_memory_[support];
     if (memory.epoch != support_epoch_ || !memory.active) continue;
-    if (memory.state != SupportState::Closed && neighborhood_completed) {
+    if (move_memory_usable_ && memory.state != SupportState::Closed &&
+        neighborhood_completed) {
       move_memory_.put(memory.key, memory.entry);
     }
     double delta = memory.entry.candidate_cost;
@@ -3696,6 +6062,9 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   if (!best_move.has_value()) return std::nullopt;
 
   const RouteChanges best_changes = materialize_changes(best_move->move);
+  const MoveSupport best_support = move_support(best_move->move);
+  const bool projected_opening =
+      project_opening_station_visits_ && best_support.opens_route;
 
   struct PreparedChange {
     std::size_t route{};
@@ -3706,12 +6075,54 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   for (const auto& [route, sequence] : best_changes) {
     std::optional<Plan> plan;
     if (!sequence.empty()) {
-      plan = prepared_plan(sequence);
+      if (best_move->move.physical_reverse_two_opt ||
+          best_move->move.physical_forward_two_opt) {
+        const std::size_t child = route == best_move->move.changes[0].route ? 0 : 1;
+        plan = factory_.plan_visits(physical_two_opt_visits(best_move->move, child));
+        if (plan->customer_ids != sequence) {
+          throw std::logic_error("physical 2OPT customer descriptor differs");
+        }
+      } else if (best_move->move.physical_relocate) {
+        const auto& move = best_move->move;
+        auto visits = solution.plans.at(route).route.visits;
+        const int customer = solution.plans.at(move.relocate_source_route)
+            .route.visits.at(move.relocate_source_position);
+        if (route == move.relocate_source_route) {
+          visits.erase(visits.begin() +
+                       static_cast<std::ptrdiff_t>(move.relocate_source_position));
+        }
+        if (route == move.relocate_target_route) {
+          const std::size_t slot = move.relocate_target_slot -
+              static_cast<std::size_t>(move.relocate_source_route == route &&
+                  move.relocate_source_position < move.relocate_target_slot);
+          visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(slot), customer);
+        }
+        plan = factory_.plan_visits(std::move(visits));
+        if (plan->customer_ids != sequence) {
+          throw std::logic_error("physical Relocate customer descriptor differs");
+        }
+      } else if (physical_swap) {
+        auto visits = solution.plans.at(route).route.visits;
+        std::size_t customer = 0;
+        for (int& id : visits) {
+          if (instance_.node(id).kind == NodeKind::Customer) {
+            id = sequence.at(customer++);
+          }
+        }
+        if (customer != sequence.size()) throw std::logic_error("Swap materialization size");
+        plan = factory_.plan_visits(std::move(visits));
+      } else {
+        plan = projected_opening
+            ? factory_.plan_visits(project_opening_visits(
+                  instance_, solution.plans[best_support.first],
+                  best_changes.back().second.front(), route == route_count))
+            : prepared_plan(sequence);
+      }
       if (completes_vnd_winner(profile_)) {
         ++statistics_.linked_completion_attempts;
         const auto direct_gaps = plan->gaps;
         plan = path_sampler_.repair_new_gaps(
-            std::move(*plan), reference_gaps, penalty_lambda, deadline);
+            std::move(*plan), ensure_reference_gaps(), penalty_lambda, deadline);
         if (plan->gaps != direct_gaps) {
           ++statistics_.linked_completion_changed_attempts;
         }
@@ -3749,19 +6160,40 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
 }
 
 std::optional<Solution> VariableNeighborhoodDescent::replace_path_neighbor(
-    const Solution& solution, double penalty_lambda) {
+    const Solution& solution, double penalty_lambda,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
   ++statistics_.replace_path_calls;
   if (solution.plans.empty()) return std::nullopt;
   const double current_cost =
       generalized_cost(solution, instance_, penalty_lambda);
-  auto candidate = path_sampler_.random_replacement(solution);
-  if (candidate.has_value() &&
-      generalized_cost(*candidate, instance_, penalty_lambda) <
-          current_cost - kCostTolerance) {
-    ++statistics_.replace_path_accepted;
-    return candidate;
+  for (std::size_t attempt = 0; attempt < replace_path_attempts_; ++attempt) {
+    // Preserve the original single-proposal deadline/RNG behavior. Only the
+    // explicit repeated stage adds deadline checks before later proposals.
+    if (attempt != 0 && expired(deadline)) break;
+    ++statistics_.replace_path_proposals;
+    auto proposal = path_sampler_.random_replacement_proposal(solution);
+    if (!proposal.has_value()) {
+      ++statistics_.replace_path_null_proposals;
+      continue;
+    }
+    // Exactly the original generalized_cost(Solution) addition order. Avoid
+    // a delta or subtract/add update, which can change floating-point ties.
+    double candidate_cost = 0.0;
+    for (std::size_t route = 0; route < solution.plans.size(); ++route) {
+      const Plan& plan = route == proposal->route_index
+          ? proposal->plan : solution.plans[route];
+      candidate_cost += generalized_cost(*plan.evaluation, instance_, penalty_lambda);
+    }
+    if (candidate_cost < current_cost - kCostTolerance) {
+      ++statistics_.replace_path_accepted;
+      Solution candidate = solution;
+      candidate.plans[proposal->route_index] = std::move(proposal->plan);
+      return candidate;
+    }
+    ++statistics_.replace_path_nonimproving_proposals;
   }
-  // Section 5.1.5 samples one current path and one alternative path.
+  // The explicit four-proposal A experiment failed its G1 quality screen.
+  // The active contract remains one proposal, including null proposals.
   return std::nullopt;
 }
 

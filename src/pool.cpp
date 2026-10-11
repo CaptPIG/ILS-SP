@@ -57,16 +57,24 @@ RouteColumn RouteColumn::from_plan(const Plan& plan) {
                      .signature = plan.route.visits};
 }
 
-RoutePool::RoutePool(std::size_t capacity, double tolerance)
-    : capacity_(capacity), tolerance_(tolerance) {
-  if (capacity_ == 0 || tolerance_ < 0.0) {
+RoutePool::RoutePool(std::size_t capacity, double tolerance,
+                     PoolIdentity identity, bool keep_evicted_in_backup)
+    : capacity_(capacity), tolerance_(tolerance), identity_(identity),
+      keep_evicted_in_backup_(keep_evicted_in_backup) {
+  if (capacity_ == 0 || !std::isfinite(tolerance_) || tolerance_ < 0.0) {
     throw std::invalid_argument("invalid route-pool configuration");
   }
   main_.reserve(capacity_);
 }
 
+const std::vector<int>& RoutePool::column_key(const RouteColumn& column) const {
+  return identity_ == PoolIdentity::CustomerCoverage
+             ? column.customer_set
+             : column.plan.customer_ids;
+}
+
 void RoutePool::put_main(RouteColumn column) {
-  const std::vector<int> customer_key = column.plan.customer_ids;
+  const std::vector<int> customer_key = column_key(column);
   backup_.erase(customer_key);
   const auto incumbent = main_.find(customer_key);
   if (incumbent != main_.end()) index_main_erase(incumbent->second);
@@ -117,17 +125,17 @@ void RoutePool::demote_main(ColumnMap::iterator column) {
   RouteColumn demoted = std::move(column->second);
   index_main_erase(demoted);
   main_.erase(column);
-  put_backup(std::move(demoted));
+  if (keep_evicted_in_backup_) put_backup(std::move(demoted));
   ++statistics_.main_demotions;
 }
 
 void RoutePool::put_backup(RouteColumn column) {
-  const auto found = backup_.find(column.plan.customer_ids);
+  const auto found = backup_.find(column_key(column));
   if (found == backup_.end() ||
       column.cost_h < found->second.cost_h - tolerance_ ||
       (std::abs(column.cost_h - found->second.cost_h) <= tolerance_ &&
        column.plan.exact_charging && !found->second.plan.exact_charging)) {
-    const std::vector<int> customer_key = column.plan.customer_ids;
+    const std::vector<int> customer_key = column_key(column);
     backup_.insert_or_assign(customer_key, std::move(column));
     ++statistics_.backup_insertions;
   }
@@ -160,7 +168,8 @@ RoutePool::ColumnMap::iterator RoutePool::worst_main() {
 
 PoolUpdate RoutePool::admit(RouteColumn column) {
   ++statistics_.admission_attempts;
-  const auto incumbent = main_.find(column.plan.customer_ids);
+  const std::vector<int> key = column_key(column);
+  const auto incumbent = main_.find(key);
   if (incumbent != main_.end()) {
     if (incumbent_dominates(incumbent->second, column, tolerance_)) {
       ++statistics_.dominated_rejections;
@@ -168,18 +177,22 @@ PoolUpdate RoutePool::admit(RouteColumn column) {
     }
     const std::optional<double> old_coverage_cost =
         best_coverage_cost(column.customer_set);
-    const std::vector<int> replaced = incumbent->first;
+    const std::vector<int> replaced = incumbent->second.plan.customer_ids;
     put_main(std::move(column));
-    ++statistics_.same_sequence_replacements;
+    if (identity_ == PoolIdentity::CustomerCoverage) {
+      ++statistics_.same_coverage_replacements;
+    } else {
+      ++statistics_.same_sequence_replacements;
+    }
     const bool effective = coverage_improved(
-        old_coverage_cost, best_coverage_cost(main_.at(replaced).customer_set));
+        old_coverage_cost, best_coverage_cost(main_.at(key).customer_set));
     record_effective_coverage_improvement(effective);
     return PoolUpdate{.main = true,
                       .replaced_dominated = true,
                       .effective_coverage_improvement = effective,
                       .evicted_customer_sequence = replaced};
   }
-  const auto backup_incumbent = backup_.find(column.plan.customer_ids);
+  const auto backup_incumbent = backup_.find(key);
   if (backup_incumbent != backup_.end() &&
       incumbent_dominates(backup_incumbent->second, column, tolerance_)) {
     ++statistics_.dominated_rejections;
@@ -207,21 +220,23 @@ PoolUpdate RoutePool::admit(RouteColumn column) {
                       .evicted_customer_sequence = std::nullopt};
   }
 
-  const std::vector<int> new_sequence = column.plan.customer_ids;
   const std::vector<int> new_coverage = column.customer_set;
   const std::optional<double> old_coverage_cost =
       best_coverage_cost(new_coverage);
   put_main(std::move(column));
   auto worst = worst_main();
-  const std::vector<int> evicted = worst->first;
-  const bool new_survived = evicted != new_sequence;
+  const std::vector<int> evicted = worst->second.plan.customer_ids;
+  const bool new_survived = worst->first != key;
   demote_main(worst);
+  if (new_survived && duals_valid_) {
+    ++statistics_.negative_reduced_cost_admissions;
+  }
   const bool effective =
       new_survived &&
       coverage_improved(old_coverage_cost, best_coverage_cost(new_coverage));
   record_effective_coverage_improvement(effective);
   return PoolUpdate{.main = new_survived,
-                    .backup = !new_survived,
+                    .backup = !new_survived && keep_evicted_in_backup_,
                     .replaced_dominated = false,
                     .effective_coverage_improvement = effective,
                     .evicted_customer_sequence = evicted};
@@ -242,7 +257,7 @@ PoolRepriceUpdate RoutePool::reprice_backup() {
   PoolRepriceUpdate update{.candidates = candidates.size()};
   statistics_.repricing_candidates += candidates.size();
   for (RouteColumn& candidate : candidates) {
-    backup_.erase(candidate.plan.customer_ids);
+    backup_.erase(column_key(candidate));
     const PoolUpdate admitted = admit(std::move(candidate));
     if (admitted.main) ++update.promoted;
     if (admitted.effective_coverage_improvement) {
@@ -266,7 +281,10 @@ void RoutePool::protect_partition(const Solution& solution) {
   std::unordered_set<std::vector<int>, IntVectorHash> protected_sequences;
   protected_sequences.reserve(solution.plans.size());
   for (const Plan& plan : solution.plans) {
-    if (!protected_sequences.insert(plan.customer_ids).second) {
+    const auto key = identity_ == PoolIdentity::CustomerCoverage
+                         ? sorted_customer_set(plan.customer_ids)
+                         : plan.customer_ids;
+    if (!protected_sequences.insert(key).second) {
       throw std::invalid_argument(
           "protected route partition repeats an ordered customer sequence");
     }
@@ -278,7 +296,7 @@ void RoutePool::protect_partition(const Solution& solution) {
     const std::vector<int> coverage = candidate.customer_set;
     const std::optional<double> old_coverage_cost =
         best_coverage_cost(coverage);
-    const auto incumbent = main_.find(plan.customer_ids);
+    const auto incumbent = main_.find(column_key(candidate));
     if (incumbent == main_.end() ||
         !incumbent_dominates(incumbent->second, candidate, tolerance_)) {
       put_main(std::move(candidate));

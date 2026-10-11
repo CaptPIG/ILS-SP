@@ -2,10 +2,51 @@
 
 #include <array>
 #include <limits>
+#include <new>
 #include <numeric>
 #include <stdexcept>
 
 namespace ils_sp {
+
+const ChargingCurve& NonlinearSequenceEvaluator::station_curve(
+    int station_id) const {
+  if (station_curves_ready_) {
+    if (station_id >= 0 &&
+        static_cast<std::size_t>(station_id) < station_curves_by_id_.size()) {
+      if (const auto* curve =
+              station_curves_by_id_[static_cast<std::size_t>(station_id)]) {
+        return *curve;
+      }
+    }
+    return instance_.curve_for_station(station_id);
+  }
+
+  // Preserve the first requested lookup and its errors before doing cache work.
+  const ChargingCurve& first = instance_.curve_for_station(station_id);
+  const auto& nodes = instance_.nodes();
+  bool dense = true;
+  for (std::size_t index = 0; index < nodes.size(); ++index) {
+    if (nodes[index].id < 0 ||
+        static_cast<std::size_t>(nodes[index].id) != index) {
+      dense = false;
+      break;
+    }
+  }
+  if (dense) {
+    try {
+      std::vector<const ChargingCurve*> curves(nodes.size(), nullptr);
+      for (const int id : instance_.station_ids()) {
+        curves[static_cast<std::size_t>(id)] = &instance_.curve_for_station(id);
+      }
+      station_curves_by_id_.swap(curves);
+    } catch (const std::bad_alloc&) {
+      // An optional identity index must not make an otherwise valid evaluation
+      // fail under memory pressure. Keep the original getter without retries.
+    }
+  }
+  station_curves_ready_ = true;
+  return first;
+}
 
 ChargingSequenceLabel NonlinearSequenceEvaluator::edge_label(
     int origin_id, std::span<const int> station_ids, int target_id) const {
@@ -100,8 +141,29 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate(
   if (!route.initialized) {
     throw std::invalid_argument("cannot evaluate an empty sequence label");
   }
-  return evaluate_data(route.travel_time_h, route.service_time_h,
-                       route.station_legs, route.tail_energy_wh);
+  return evaluate_data<false>(route.travel_time_h, route.service_time_h,
+                              route.station_legs, route.tail_energy_wh);
+}
+
+NonlinearSequenceEvaluator::BoundedEvaluation
+NonlinearSequenceEvaluator::evaluate_bounded(
+    const ChargingSequenceLabel& route, double penalty_lambda,
+    double incumbent_limit, double minimum_limit,
+    bool all_charging_rates_finite) const {
+  if (!std::isfinite(penalty_lambda) || penalty_lambda < 0.0) {
+    throw std::invalid_argument("penalty lambda must be finite and nonnegative");
+  }
+  if (penalty_lambda == 0.0 || !bounded_evaluation_compatible()) {
+    return evaluate(route);
+  }
+  if (!route.initialized) {
+    throw std::invalid_argument("cannot evaluate an empty sequence label");
+  }
+  return evaluate_data<true>(
+      route.travel_time_h, route.service_time_h, route.station_legs,
+      route.tail_energy_wh,
+      BoundedLimits{penalty_lambda, incumbent_limit, minimum_limit,
+                    all_charging_rates_finite});
 }
 
 RouteCostSummary NonlinearSequenceEvaluator::evaluate(
@@ -151,16 +213,20 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate(
     }
     tail_energy_wh = component->tail_energy_wh;
   }
-  return evaluate_data(
+  return evaluate_data<false>(
       travel_time_h, service_time_h,
       std::span<const ChargingSequenceLeg>{station_legs, station_count},
       tail_energy_wh);
 }
 
-RouteCostSummary NonlinearSequenceEvaluator::evaluate_data(
+template <bool Bounded>
+std::conditional_t<Bounded, NonlinearSequenceEvaluator::BoundedEvaluation,
+                   RouteCostSummary>
+NonlinearSequenceEvaluator::evaluate_data(
     double travel_time_h, double service_time_h,
     std::span<const ChargingSequenceLeg> station_legs,
-    double tail_energy_wh) const {
+    double tail_energy_wh,
+    std::conditional_t<Bounded, BoundedLimits, std::monostate> limits) const {
   const double capacity = instance_.vehicle().battery_capacity_wh;
   const std::size_t station_count = station_legs.size();
   const double no_charge_duration_h = travel_time_h + service_time_h;
@@ -241,46 +307,69 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate_data(
         shortfall_wh += required_wh;
         arrival[position] += required_wh;
         departure[position] += required_wh;
+        if constexpr (Bounded) {
+          const NonlinearCostLowerBound lower_bound{
+              .travel_time_h = travel_time_h,
+              .energy_shortfall_wh = shortfall_wh,
+              .duration_excess_h = std::max(
+                  0.0, no_charge_duration_h -
+                           instance_.vehicle().max_route_duration_h)};
+          const double cost =
+              lower_bound.generalized_cost(instance_, limits.penalty_lambda);
+          if (cost >= limits.incumbent_limit || cost > limits.minimum_limit) {
+            return lower_bound;
+          }
+        }
         break;
-      }
-
-      double suffix_slack = std::numeric_limits<double>::infinity();
-      const std::size_t earliest_station = preceding_station(0);
-      for (std::size_t reverse = position; reverse-- > earliest_station;) {
-        suffix_slack =
-            std::min(suffix_slack, capacity - departure[reverse]);
-        capacity_slack[reverse] = suffix_slack;
       }
 
       std::optional<std::size_t> best_station;
       double best_rate = -1.0;
       double best_available_wh = 0.0;
-      for (std::size_t station_index = 0; station_index < preceding_count;
-           ++station_index) {
-        const std::size_t station_position =
-            preceding_station(station_index);
-        const int station_id =
-            station_legs[station_position - 1].station_id;
-        const ChargingCurve& curve = instance_.curve_for_station(station_id);
-        const double current_energy = departure[station_position];
-        if (current_energy < -kEnergyToleranceWh) continue;
-        const double segment_slack =
-            curve.next_breakpoint_energy(current_energy) - current_energy;
-        double available_wh =
-            std::min(capacity_slack[station_position], segment_slack);
-        if (available_wh <= kEnergyToleranceWh) continue;
-        const double rate = curve.marginal_rate_at(current_energy);
-        if (!std::isinf(rate)) {
-          available_wh = std::min(available_wh, remaining_shift_h * rate);
+      bool scan_stations = true;
+      if constexpr (Bounded) {
+        // With a certified finite rate, original 0 * rate makes every
+        // station ineligible. Inf rates may still charge for zero time and
+        // must keep the original scan. Preserve the original shortage branch.
+        scan_stations = !(limits.all_charging_rates_finite &&
+                          remaining_shift_h == 0.0);
+      }
+      if (scan_stations) {
+        double suffix_slack = std::numeric_limits<double>::infinity();
+        const std::size_t earliest_station = preceding_station(0);
+        for (std::size_t reverse = position; reverse-- > earliest_station;) {
+          suffix_slack =
+              std::min(suffix_slack, capacity - departure[reverse]);
+          capacity_slack[reverse] = suffix_slack;
         }
-        if (available_wh <= kEnergyToleranceWh) continue;
-        if (rate > best_rate + 1e-9 ||
-            (std::abs(rate - best_rate) <= 1e-9 &&
-             (!best_station.has_value() ||
-              station_position > *best_station))) {
-          best_station = station_position;
-          best_rate = rate;
-          best_available_wh = available_wh;
+
+        for (std::size_t station_index = 0; station_index < preceding_count;
+             ++station_index) {
+          const std::size_t station_position =
+              preceding_station(station_index);
+          const int station_id =
+              station_legs[station_position - 1].station_id;
+          const ChargingCurve& curve = station_curve(station_id);
+          const double current_energy = departure[station_position];
+          if (current_energy < -kEnergyToleranceWh) continue;
+          const double segment_slack =
+              curve.next_breakpoint_energy(current_energy) - current_energy;
+          double available_wh =
+              std::min(capacity_slack[station_position], segment_slack);
+          if (available_wh <= kEnergyToleranceWh) continue;
+          const double rate = curve.marginal_rate_at(current_energy);
+          if (!std::isinf(rate)) {
+            available_wh = std::min(available_wh, remaining_shift_h * rate);
+          }
+          if (available_wh <= kEnergyToleranceWh) continue;
+          if (rate > best_rate + 1e-9 ||
+              (std::abs(rate - best_rate) <= 1e-9 &&
+               (!best_station.has_value() ||
+                station_position > *best_station))) {
+            best_station = station_position;
+            best_rate = rate;
+            best_available_wh = available_wh;
+          }
         }
       }
 
@@ -288,13 +377,26 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate_data(
         shortfall_wh += required_wh;
         arrival[position] += required_wh;
         departure[position] += required_wh;
+        if constexpr (Bounded) {
+          const NonlinearCostLowerBound lower_bound{
+              .travel_time_h = travel_time_h,
+              .energy_shortfall_wh = shortfall_wh,
+              .duration_excess_h = std::max(
+                  0.0, no_charge_duration_h -
+                           instance_.vehicle().max_route_duration_h)};
+          const double cost =
+              lower_bound.generalized_cost(instance_, limits.penalty_lambda);
+          if (cost >= limits.incumbent_limit || cost > limits.minimum_limit) {
+            return lower_bound;
+          }
+        }
         break;
       }
 
       const double charged_wh = std::min(required_wh, best_available_wh);
       const int station_id =
           station_legs[*best_station - 1].station_id;
-      const ChargingCurve& curve = instance_.curve_for_station(station_id);
+      const ChargingCurve& curve = station_curve(station_id);
       const double charge_duration_h = curve.charge_duration(
           departure[*best_station], departure[*best_station] + charged_wh);
       departure[*best_station] += charged_wh;
@@ -317,7 +419,7 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate_data(
     const int station_id = station_legs[position - 1].station_id;
     const double start = std::clamp(arrival[position], 0.0, capacity);
     const double finish = std::clamp(departure[position], start, capacity);
-    charging_time_h += instance_.curve_for_station(station_id).charge_duration(
+    charging_time_h += station_curve(station_id).charge_duration(
         start, finish);
   }
   const double raw_cost_h = travel_time_h + charging_time_h;
@@ -347,6 +449,17 @@ double generalized_cost(const RouteCostSummary& summary,
              (summary.energy_shortfall_wh /
                   instance.vehicle().consumption_wh_per_km +
               summary.duration_excess_h);
+}
+
+double NonlinearCostLowerBound::generalized_cost(
+    const Instance& instance, double penalty_lambda) const {
+  // This temporary numeric envelope only reuses the original cost kernel.
+  // Its default fields do not carry a completed evaluation or feasibility.
+  const RouteCostSummary numeric_envelope{
+      .raw_cost_h = travel_time_h,
+      .energy_shortfall_wh = energy_shortfall_wh,
+      .duration_excess_h = duration_excess_h};
+  return ils_sp::generalized_cost(numeric_envelope, instance, penalty_lambda);
 }
 
 double NonlinearSequenceEvaluator::generalized_cost(
@@ -658,37 +771,89 @@ std::size_t RouteEvaluator::cache_evictions() const noexcept {
 }
 
 PlanFactory::PlanFactory(const Instance& instance, RouteEvaluator& evaluator,
-                         std::size_t exact_cache_capacity)
+                         std::size_t exact_cache_capacity,
+                         bool allow_inherited_station_revisits)
     : instance_(instance),
       evaluator_(evaluator),
-      exact_cache_(exact_cache_capacity) {}
+      exact_cache_(exact_cache_capacity),
+      allow_inherited_station_revisits_(allow_inherited_station_revisits) {}
+
+void PlanFactory::validate_node_sequence(std::span<const int> ids,
+                                         NodeKind kind, const char* error) {
+  if (ids.empty()) return;
+  // Node references always refer to this immutable instance's node array,
+  // including sparse/negative IDs. Its ordinal is a unique membership key.
+  validation_marks_.resize(instance_.nodes().size());
+  if (++validation_epoch_ == 0) {
+    std::fill(validation_marks_.begin(), validation_marks_.end(), 0);
+    ++validation_epoch_;
+  }
+  for (const int id : ids) {
+    const Node& node = instance_.node(id);  // Preserve unknown-ID exceptions.
+    if (node.kind != kind) throw std::invalid_argument(error);
+    auto& mark = validation_marks_[static_cast<std::size_t>(
+        &node - instance_.nodes().data())];
+    if (mark == validation_epoch_) throw std::invalid_argument(error);
+    mark = validation_epoch_;
+  }
+}
 
 Plan PlanFactory::make_plan(std::vector<int> customer_ids,
                             std::vector<std::vector<int>> gaps) {
   if (customer_ids.empty()) {
     throw std::invalid_argument("a route plan needs at least one customer");
   }
-  std::unordered_set<int> seen;
-  for (const int customer_id : customer_ids) {
-    if (instance_.node(customer_id).kind != NodeKind::Customer ||
-        !seen.insert(customer_id).second) {
-      throw std::invalid_argument("invalid customer sequence");
-    }
-  }
+  validate_node_sequence(customer_ids, NodeKind::Customer,
+                         "invalid customer sequence");
   for (const auto& gap : gaps) {
-    std::unordered_set<int> gap_stations;
-    for (const int station_id : gap) {
-      if (instance_.node(station_id).kind != NodeKind::Station ||
-          !gap_stations.insert(station_id).second) {
-        throw std::invalid_argument("a gap must be a simple station path");
+    if (allow_inherited_station_revisits_) {
+      for (const int station : gap) {
+        if (instance_.node(station).kind != NodeKind::Station) {
+          throw std::invalid_argument("a gap must contain only stations");
+        }
       }
+    } else {
+      // The default and generated catalogs retain simple charging paths.
+      validate_node_sequence(gap, NodeKind::Station,
+                             "a gap must be a simple station path");
     }
   }
   Route route = expand_route(customer_ids, gaps);
+  return assemble_plan(std::move(customer_ids), std::move(gaps),
+                       std::move(route));
+}
+
+Plan PlanFactory::plan_visits(std::vector<int> visits) {
+  std::vector<int> customers;
+  std::vector<std::vector<int>> gaps(1);
+  for (const int id : visits) {
+    const NodeKind kind = instance_.node(id).kind;
+    if (kind == NodeKind::Customer) {
+      customers.push_back(id);
+      gaps.emplace_back();
+    } else if (kind == NodeKind::Station) {
+      gaps.back().push_back(id);
+    } else {
+      throw std::invalid_argument("the depot is implicit in a route plan");
+    }
+  }
+  if (customers.empty()) {
+    throw std::invalid_argument("a route plan needs at least one customer");
+  }
+  validate_node_sequence(customers, NodeKind::Customer,
+                         "invalid customer sequence");
+  return assemble_plan(std::move(customers), std::move(gaps),
+                       Route{.visits = std::move(visits)});
+}
+
+Plan PlanFactory::assemble_plan(std::vector<int> customer_ids,
+                                std::vector<std::vector<int>> gaps,
+                                Route route) {
+  auto evaluation = evaluator_.evaluate(route);
   return Plan{.customer_ids = std::move(customer_ids),
               .gaps = std::move(gaps),
-              .route = route,
-              .evaluation = evaluator_.evaluate(route),
+              .route = std::move(route),
+              .evaluation = std::move(evaluation),
               .exact_charging = false};
 }
 
@@ -729,17 +894,16 @@ Plan PlanFactory::plan_sequence(const std::vector<int>& customer_ids,
 Plan PlanFactory::plan_sequence(const std::vector<int>& customer_ids,
                                 const GapMap& reference_gaps) {
   std::vector<std::vector<int>> gaps = direct_gaps(customer_ids.size());
-  std::vector<int> anchors;
-  anchors.reserve(customer_ids.size() + 2);
-  anchors.push_back(instance_.depot().id);
-  anchors.insert(anchors.end(), customer_ids.begin(), customer_ids.end());
-  anchors.push_back(instance_.depot().id);
-  for (std::size_t gap = 0; gap + 1 < anchors.size(); ++gap) {
+  const int depot = instance_.depot().id;
+  int origin = depot;
+  for (std::size_t gap = 0; gap < gaps.size(); ++gap) {
+    const int target = gap < customer_ids.size() ? customer_ids[gap] : depot;
     const auto found =
-        reference_gaps.find(AnchorPair{anchors[gap], anchors[gap + 1]});
+        reference_gaps.find(AnchorPair{origin, target});
     if (found != reference_gaps.end()) {
       gaps[gap] = found->second;
     }
+    origin = target;
   }
   return make_plan(customer_ids, std::move(gaps));
 }
@@ -751,6 +915,216 @@ void PlanFactory::publish_exact(Plan plan) {
   }
   const std::vector<int> customer_key = plan.customer_ids;
   exact_cache_.put(customer_key, std::move(plan));
+}
+
+PhysicalRouteScorer::PhysicalRouteScorer(const Instance& instance,
+                                        const Plan& plan, bool support_swaps)
+    : instance_(instance), evaluator_(instance) {
+  nodes_.reserve(plan.route.visits.size() + 2);
+  nodes_.push_back(instance.depot().id);
+  for (const int id : plan.route.visits) {
+    const NodeKind kind = instance.node(id).kind;
+    if (kind == NodeKind::Depot) {
+      throw std::invalid_argument("the depot is implicit in a route plan");
+    }
+    if (kind == NodeKind::Customer && !customers_.insert(id).second) {
+      throw std::invalid_argument("a route repeats a customer");
+    }
+    nodes_.push_back(id);
+  }
+  if (customers_.empty()) {
+    throw std::invalid_argument("a scored route needs at least one customer");
+  }
+  nodes_.push_back(instance.depot().id);
+  std::vector<ChargingSequenceLabel> edges;
+  edges.reserve(nodes_.size() - 1);
+  for (std::size_t index = 0; index + 1 < nodes_.size(); ++index) {
+    edges.push_back(
+        evaluator_.edge_label(nodes_[index], {}, nodes_[index + 1]));
+  }
+  prefixes_.resize(nodes_.size());
+  suffixes_.resize(nodes_.size());
+  for (std::size_t index = 0; index < edges.size(); ++index) {
+    prefixes_[index + 1] =
+        evaluator_.concatenate(prefixes_[index], edges[index]);
+  }
+  for (std::size_t index = edges.size(); index-- > 0;) {
+    suffixes_[index] =
+        evaluator_.concatenate(edges[index], suffixes_[index + 1]);
+  }
+  if (support_swaps) {
+    swap_range_base_ = 1;
+    while (swap_range_base_ < edges.size()) swap_range_base_ *= 2;
+    swap_ranges_.resize(2 * swap_range_base_);
+    for (std::size_t index = 0; index < edges.size(); ++index) {
+      swap_ranges_[swap_range_base_ + index] = std::move(edges[index]);
+    }
+    for (std::size_t index = swap_range_base_; index-- > 1;) {
+      swap_ranges_[index] = evaluator_.concatenate(
+          swap_ranges_[2 * index], swap_ranges_[2 * index + 1]);
+    }
+  }
+}
+
+RouteCostSummary PhysicalRouteScorer::evaluate_replacement(
+    std::size_t physical_customer_position, int customer_id) const {
+  if (physical_customer_position >= nodes_.size() - 2) {
+    throw std::out_of_range("physical replacement position is out of range");
+  }
+  const std::size_t index = physical_customer_position + 1;
+  if (instance_.node(nodes_[index]).kind != NodeKind::Customer ||
+      instance_.node(customer_id).kind != NodeKind::Customer ||
+      customers_.contains(customer_id)) {
+    throw std::invalid_argument("physical replacement requires a new customer");
+  }
+  const auto incoming = evaluator_.edge_label(nodes_[index - 1], {}, customer_id);
+  const auto outgoing = evaluator_.edge_label(customer_id, {}, nodes_[index + 1]);
+  std::array<const ChargingSequenceLabel*, 4> components;
+  std::size_t count = 0;
+  if (prefixes_[index - 1].initialized) components[count++] = &prefixes_[index - 1];
+  components[count++] = &incoming;
+  components[count++] = &outgoing;
+  if (suffixes_[index + 1].initialized) components[count++] = &suffixes_[index + 1];
+  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+      components.data(), count});
+}
+
+RouteCostSummary PhysicalRouteScorer::evaluate_swap(
+    std::size_t first_physical_position,
+    std::size_t second_physical_position) const {
+  if (first_physical_position >= second_physical_position ||
+      second_physical_position >= nodes_.size() - 2) {
+    throw std::out_of_range("physical Swap positions are invalid");
+  }
+  const std::size_t a = first_physical_position + 1;
+  const std::size_t b = second_physical_position + 1;
+  if (b <= a + 1 || swap_ranges_.empty() ||
+      instance_.node(nodes_[a]).kind != NodeKind::Customer ||
+      instance_.node(nodes_[b]).kind != NodeKind::Customer) {
+    throw std::invalid_argument("physical Swap needs nonadjacent customers and range labels");
+  }
+  const auto in_a = evaluator_.edge_label(nodes_[a - 1], {}, nodes_[b]);
+  const auto out_a = evaluator_.edge_label(nodes_[b], {}, nodes_[a + 1]);
+  const auto in_b = evaluator_.edge_label(nodes_[b - 1], {}, nodes_[a]);
+  const auto out_b = evaluator_.edge_label(nodes_[a], {}, nodes_[b + 1]);
+  std::array<const ChargingSequenceLabel*, 256> components;
+  std::size_t count = 0;
+  const auto add = [&](const ChargingSequenceLabel& label) {
+    if (count == components.size()) throw std::length_error("physical Swap range bound");
+    if (label.initialized) components[count++] = &label;
+  };
+  add(prefixes_[a - 1]); add(in_a); add(out_a);
+  std::array<std::size_t, 128> right_nodes;
+  std::size_t right_count = 0;
+  std::size_t left = a + 1 + swap_range_base_;
+  std::size_t right = b - 1 + swap_range_base_;
+  while (left < right) {
+    if (left & 1U) add(swap_ranges_[left++]);
+    if (right & 1U) right_nodes[right_count++] = --right;
+    left /= 2; right /= 2;
+  }
+  while (right_count) add(swap_ranges_[right_nodes[--right_count]]);
+  add(in_b); add(out_b); add(suffixes_[b + 1]);
+  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+      components.data(), count});
+}
+
+RouteCostSummary PhysicalRouteScorer::evaluate_relocate(
+    std::size_t physical_customer_position, std::size_t original_physical_slot) const {
+  if (physical_customer_position >= nodes_.size() - 2 ||
+      original_physical_slot >= nodes_.size() - 1) {
+    throw std::out_of_range("physical Relocate positions are invalid");
+  }
+  const std::size_t a = physical_customer_position + 1;
+  const std::size_t q = original_physical_slot;
+  if (instance_.node(nodes_[a]).kind != NodeKind::Customer || swap_ranges_.empty()) {
+    throw std::invalid_argument("physical Relocate needs a customer and range labels");
+  }
+  if (q == a - 1 || q == a) return evaluator_.evaluate(prefixes_.back());
+  std::array<const ChargingSequenceLabel*, 256> components;
+  std::size_t count = 0;
+  const auto add = [&](const ChargingSequenceLabel& label) {
+    if (count == components.size()) throw std::length_error("physical Relocate range bound");
+    if (label.initialized) components[count++] = &label;
+  };
+  const auto range = [&](std::size_t begin, std::size_t end) {
+    std::array<std::size_t, 128> right_nodes;
+    std::size_t right_count = 0;
+    std::size_t left = begin + swap_range_base_, right = end + swap_range_base_;
+    while (left < right) {
+      if (left & 1U) add(swap_ranges_[left++]);
+      if (right & 1U) right_nodes[right_count++] = --right;
+      left /= 2; right /= 2;
+    }
+    while (right_count) add(swap_ranges_[right_nodes[--right_count]]);
+  };
+  const auto removal = evaluator_.edge_label(nodes_[a - 1], {}, nodes_[a + 1]);
+  const auto incoming = evaluator_.edge_label(nodes_[q], {}, nodes_[a]);
+  const auto outgoing = evaluator_.edge_label(nodes_[a], {}, nodes_[q + 1]);
+  if (q < a - 1) {
+    add(prefixes_[q]); add(incoming); add(outgoing);
+    range(q + 1, a - 1); add(removal); add(suffixes_[a + 1]);
+  } else {
+    add(prefixes_[a - 1]); add(removal); range(a + 1, q);
+    add(incoming); add(outgoing); add(suffixes_[q + 1]);
+  }
+  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+      components.data(), count});
+}
+
+RouteCostSummary PhysicalRouteScorer::evaluate_insertion(
+    std::size_t physical_slot, int customer_id) const {
+  if (physical_slot >= nodes_.size() - 1) {
+    throw std::out_of_range("physical insertion slot is out of range");
+  }
+  if (instance_.node(customer_id).kind != NodeKind::Customer ||
+      customers_.contains(customer_id)) {
+    throw std::invalid_argument("physical insertion needs an unvisited customer");
+  }
+  const auto incoming =
+      evaluator_.edge_label(nodes_[physical_slot], {}, customer_id);
+  const auto outgoing =
+      evaluator_.edge_label(customer_id, {}, nodes_[physical_slot + 1]);
+  std::array<const ChargingSequenceLabel*, 4> components;
+  std::size_t count = 0;
+  if (prefixes_[physical_slot].initialized) {
+    components[count++] = &prefixes_[physical_slot];
+  }
+  components[count++] = &incoming;
+  components[count++] = &outgoing;
+  if (suffixes_[physical_slot + 1].initialized) {
+    components[count++] = &suffixes_[physical_slot + 1];
+  }
+  return evaluator_.evaluate(
+      std::span<const ChargingSequenceLabel* const>{components.data(), count});
+}
+
+RouteCostSummary PhysicalRouteScorer::evaluate_removal(
+    std::size_t physical_customer_position) const {
+  if (physical_customer_position >= nodes_.size() - 2) {
+    throw std::out_of_range("physical removal position is out of range");
+  }
+  const std::size_t node_index = physical_customer_position + 1;
+  if (instance_.node(nodes_[node_index]).kind != NodeKind::Customer) {
+    throw std::invalid_argument("physical removal must remove a customer");
+  }
+  if (customers_.size() == 1) {
+    // An LNS route with no remaining customers is discarded, including CSs.
+    return RouteCostSummary{.feasible = true};
+  }
+  const auto shortcut = evaluator_.edge_label(
+      nodes_[node_index - 1], {}, nodes_[node_index + 1]);
+  std::array<const ChargingSequenceLabel*, 3> components;
+  std::size_t count = 0;
+  if (prefixes_[node_index - 1].initialized) {
+    components[count++] = &prefixes_[node_index - 1];
+  }
+  components[count++] = &shortcut;
+  if (suffixes_[node_index + 1].initialized) {
+    components[count++] = &suffixes_[node_index + 1];
+  }
+  return evaluator_.evaluate(
+      std::span<const ChargingSequenceLabel* const>{components.data(), count});
 }
 
 struct RouteSequenceScorer::Implementation {

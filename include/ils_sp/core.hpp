@@ -128,6 +128,7 @@ class Instance {
   Vehicle vehicle_;
   std::unordered_map<std::string, ChargingCurve> charging_curves_;
   std::unordered_map<int, std::size_t> index_by_id_;
+  bool nodes_indexed_by_id_{true};
   std::vector<std::vector<double>> distances_km_;
   int depot_id_{};
   std::vector<int> customer_ids_;
@@ -168,6 +169,8 @@ struct Plan {
   std::vector<std::vector<int>> gaps;
   Route route;
   std::shared_ptr<const RouteEvaluation> evaluation;
+  // Independent certificate for this whole customer order. OPTIMAL on a
+  // TRC-pruned, incumbent-dependent path catalog alone does not set this.
   bool exact_charging{false};
 };
 
