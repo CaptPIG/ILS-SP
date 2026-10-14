@@ -304,6 +304,22 @@ class PathSampler {
 
  private:
   friend class VariableNeighborhoodDescent;
+  struct BoundedProxyChoice {
+    std::size_t position{};
+    std::vector<int> stations;
+    double proxy_cost{};
+  };
+  struct BoundedProxyScan {
+    std::optional<BoundedProxyChoice> choice;
+    std::size_t raw_descriptors{}, work{};
+    // completed=false means discard every provisional choice and fall back.
+    bool completed{};
+  };
+  [[nodiscard]] BoundedProxyScan bounded_proxy_choice(
+      const Solution& solution,
+      std::span<const std::pair<std::size_t, std::size_t>> gaps,
+      std::size_t first, double penalty_lambda,
+      std::size_t descriptor_cap = 256, std::size_t work_cap = 4096);
   struct RandomReplacementProposal {
     std::size_t route_index{};
     Plan plan;
@@ -556,9 +572,42 @@ class PathSampler {
 };
 
 struct InsertionCandidateStatistics {
+  // Joint-branch attempted work, including work discarded by whole-S fallback.
+  std::uint64_t joint_repair_calls{};
+  // Local rank reuse: physical_insertion_candidates remains logical positions.
+  std::uint64_t joint_rank_cache_hits{};
+  std::uint64_t joint_rank_cache_misses{};
+  std::uint64_t joint_rank_fresh_descriptors{};
+  std::uint64_t joint_rank_reused_descriptors{};
+  std::uint64_t joint_rank_score_calls{};
+  std::uint64_t joint_removed_station_tokens{};
+  std::uint64_t joint_customer_insertion_attempts{};
+  std::uint64_t joint_station_insertion_attempts{};
+  std::uint64_t joint_blocked_token_scans{};
+  std::uint64_t joint_deadlock_rollbacks{};
+  std::uint64_t joint_invariant_rollbacks{};
+  std::uint64_t joint_max_pending_tokens{};
+  std::uint64_t joint_max_removed_station_tokens{};
+
+  std::uint64_t station_shells_retained{};
+  std::uint64_t station_shells_activated{};
+  std::uint64_t station_shells_discarded{};
+  std::uint64_t station_conservation_checks{};
+  std::uint64_t station_conservation_rollbacks{};
+  std::uint64_t station_conservation_noops{};
+  std::uint64_t station_conservation_effective{};
   std::uint64_t physical_insertion_decisions{};
   std::uint64_t physical_insertion_candidates{};
   std::uint64_t physical_route_profiles_built{};
+  std::uint64_t repair_memo_hits{};
+  std::uint64_t repair_memo_misses{};
+  std::uint64_t repair_memo_epoch_changes{};
+  std::uint64_t repair_memo_invalid_entries{};
+  std::uint64_t repair_memo_evictions{};
+  std::uint64_t repair_memo_byte_bypasses{};
+  std::uint64_t repair_memo_candidates_saved{};
+  std::uint64_t repair_memo_profiles_saved{};
+
   std::uint64_t partial_route_events{};
   std::uint64_t randomized_partial_routes{};
   std::uint64_t decisions{};
@@ -626,9 +675,19 @@ class InitialSolutionBuilder {
   InsertionCandidateStatistics statistics_;
 };
 
+// Each pending station is one original visit, not a unique physical station ID.
+struct StationOccurrenceToken {
+  int station_id{};
+  std::size_t source_route{};
+  std::size_t source_visit{};
+};
+
 struct DestroyedSolution {
   Solution remaining;
   std::vector<int> removed_customers;
+  // Dormant physical CS chains from customer-empty routes. Not fleet members.
+  std::vector<std::vector<int>> station_shells;
+  std::vector<StationOccurrenceToken> removed_stations;
 };
 
 class Perturbation {
@@ -640,6 +699,7 @@ class Perturbation {
                std::size_t granular_threshold = 100,
                PartialRouteSubset partial_route_subset = PartialRouteSubset::Prefix,
                bool preserve_station_visits = false);
+  ~Perturbation();
   [[nodiscard]] Solution apply(const Solution& solution,
                                double penalty_lambda);
   [[nodiscard]] std::size_t last_removal_count() const noexcept {
@@ -652,6 +712,7 @@ class Perturbation {
 
  private:
   friend struct PerturbationTestAccess;
+  struct RepairDecisionMemo;
 
   [[nodiscard]] DestroyedSolution destroy(
       const Solution& solution, DestroyOperator operation,
@@ -660,10 +721,24 @@ class Perturbation {
                                 RepairOperator operation,
                                 double penalty_lambda,
                                 std::vector<InsertionPathHint>* hints =
-                                    nullptr);
+                                    nullptr,
+                                RepairDecisionMemo* memo = nullptr);
+  [[nodiscard]] DestroyedSolution destroy_joint_occurrences(
+      const Solution& solution, std::vector<int> removed_customers);
+  [[nodiscard]] Solution repair_joint_occurrences(
+      const Solution& original, DestroyedSolution destroyed,
+      RepairOperator operation, double penalty_lambda);
+  std::string last_joint_failure_;
+  std::uint64_t joint_station_insertions_{};
+  std::uint64_t joint_customer_insertions_{};
+  std::uint64_t joint_blocked_token_scans_{};
+
+  [[nodiscard]] Solution enforce_station_conservation(
+      const Solution& original, Solution repaired,
+      const std::vector<std::vector<int>>& expected_station_chains);
   [[nodiscard]] Solution repair_preserving_stations(
       DestroyedSolution destroyed, RepairOperator operation,
-      double penalty_lambda);
+      double penalty_lambda, RepairDecisionMemo* memo = nullptr);
 
   const Instance& instance_;
   PlanFactory& factory_;
@@ -678,9 +753,12 @@ class Perturbation {
   std::unique_ptr<GranularNeighborhood> granular_;
   InsertionCandidateStatistics statistics_;
   std::unique_ptr<RouteSequenceScorer> sequence_scorer_;
+  std::unique_ptr<RepairDecisionMemo> repair_decision_memo_;
 };
 
 struct VndStatistics {
+  std::uint64_t two_opt_reverse_label_slots_saved{};
+  std::uint64_t physical_profile_repeat_checks_saved{};
   std::uint64_t customer_neighborhood_calls{};
   std::uint64_t descriptors_considered{};
   std::uint64_t route_support_groups{};

@@ -1,106 +1,157 @@
 {
-  "source_version": "439f_plus_exact_packed_DFS_mask",
-  "source_archive_sha256": "af49f1efffbebdf444e360253a2ee37911cbfe6cd34218a03ee56f2727243830",
-  "historical_binary_sha256_reference_only": "5f0dd54d7cd7c1496e1c9ba273a5a5c5f8f61e31ac3688ee173dc337068273d4",
-  "required_compile_definitions": [
+  "schema": "ils-sp-frozen-source-v2",
+  "release": "R4",
+  "variant": "n40_dual_start_and_rc_ub0_v2",
+  "frozen_identity_sha256": "a43f547aebfc8841eef83b69fb3d5e4a7842867b9347f4ea5f5d689a23272633",
+  "frozen_input_file_count": 44,
+  "published_source_count": 27,
+  "source_bytes_unchanged": true,
+  "build_definitions": [
     "ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD=1",
     "ILS_SP_FORWARD_ONLY_TWO_OPT=1",
-    "ILS_SP_TYPED_DELETE_ENTRY=1",
+    "ILS_SP_TYPED_DELETE_ENTRY=0",
     "ILS_SP_PACKED_DFS_MASK=1"
   ],
-  "source_files": {
+  "optimized_flags": [
+    "-O3",
+    "-DNDEBUG",
+    "-flto=1"
+  ],
+  "files": {
     "include/ils_sp/copt_models.hpp": {
-      "archive_path": "cpp/include/ils_sp/copt_models.hpp",
-      "sha256": "13c02d2791987f93b4b97a04cc5c68717555bb27d9f459d5b04d9b349b3ed042"
+      "source_path": "cpp/include/ils_sp/copt_models.hpp",
+      "sha256": "576182f46f4204164e15ef88f5331f8f04609ae04f294cdc9775b9f3c042db10",
+      "git_blob_sha": "725e45ecbe7eee055d30a4906c3f7ca445e53ea7"
     },
     "include/ils_sp/core.hpp": {
-      "archive_path": "cpp/include/ils_sp/core.hpp",
-      "sha256": "b99baf5bc1724a529da0a4a73f12426b941e6424a449c2a883e9024435f68be3"
+      "source_path": "cpp/include/ils_sp/core.hpp",
+      "sha256": "b99baf5bc1724a529da0a4a73f12426b941e6424a449c2a883e9024435f68be3",
+      "git_blob_sha": "e15637d948be85c384698bba1e36614e885b1c22"
     },
     "include/ils_sp/detail/copt_result_validation.hpp": {
-      "archive_path": "cpp/include/ils_sp/detail/copt_result_validation.hpp",
-      "sha256": "b687f02b2de57a86eaac72572fb671e6ede5068fcd44a1889d799df7697b4ce5"
+      "source_path": "cpp/include/ils_sp/detail/copt_result_validation.hpp",
+      "sha256": "b687f02b2de57a86eaac72572fb671e6ede5068fcd44a1889d799df7697b4ce5",
+      "git_blob_sha": "87367b58ce6b4095d036ad2fd1025ac5ebe77a39"
     },
     "include/ils_sp/detail/frvcp_active_budget.hpp": {
-      "archive_path": "cpp/include/ils_sp/detail/frvcp_active_budget.hpp",
-      "sha256": "239785a6a401fe81f446a86624bf49e05fa92de0e1fe3f44fec298a908108fad"
+      "source_path": "cpp/include/ils_sp/detail/frvcp_active_budget.hpp",
+      "sha256": "239785a6a401fe81f446a86624bf49e05fa92de0e1fe3f44fec298a908108fad",
+      "git_blob_sha": "fd91e5c11f9a0728417c5347a5501bd1fe45fa67"
+    },
+    "include/ils_sp/detail/input_contract.hpp": {
+      "source_path": "cpp/include/ils_sp/detail/input_contract.hpp",
+      "sha256": "e7de37f57e0af808c29fc9d8d55fd69574536dfd40aca830dc03c682403b1d99",
+      "git_blob_sha": "ff779b24d5dabe5226cee7522a25acbfe57c2dd5"
+    },
+    "include/ils_sp/detail/sp_dual_certificate.hpp": {
+      "source_path": "cpp/include/ils_sp/detail/sp_dual_certificate.hpp",
+      "sha256": "7b7d54694729248661f1fbfef0d82a9fb7645d343a1964c7d16d790a3845b3ce",
+      "git_blob_sha": "c69ed886c6a715956b76a25a31f01d2db41aefde"
     },
     "include/ils_sp/detail/xxhash_api.hpp": {
-      "archive_path": "cpp/include/ils_sp/detail/xxhash_api.hpp",
-      "sha256": "affb0a548c30fc7f5b5308816aa3b4aa04753f212d6031c9d57600c629d3c50f"
+      "source_path": "cpp/include/ils_sp/detail/xxhash_api.hpp",
+      "sha256": "affb0a548c30fc7f5b5308816aa3b4aa04753f212d6031c9d57600c629d3c50f",
+      "git_blob_sha": "46d6fc786a78d7378e6e4f4b68dcfe14ca650870"
     },
     "include/ils_sp/evaluator.hpp": {
-      "archive_path": "cpp/include/ils_sp/evaluator.hpp",
-      "sha256": "b4e6301cf0cbaae942df1a9def4983a1aa339d23ec6e69044cdcbc4f0933fed2"
+      "source_path": "cpp/include/ils_sp/evaluator.hpp",
+      "sha256": "24c35ec7f24568166ff192b55b3994b83f613039f0ef6c9b98ea54ae50e735fb",
+      "git_blob_sha": "515fe533aa43378d4747191dcfd65cbfed78a3a3"
     },
     "include/ils_sp/lru_cache.hpp": {
-      "archive_path": "cpp/include/ils_sp/lru_cache.hpp",
-      "sha256": "bf5cd045b7440da4c2685e8ae19a83579e8f20c51d0ebb14488410af251ed474"
+      "source_path": "cpp/include/ils_sp/lru_cache.hpp",
+      "sha256": "bf5cd045b7440da4c2685e8ae19a83579e8f20c51d0ebb14488410af251ed474",
+      "git_blob_sha": "52c5436a77524ec3d8c3f9ab791d86558c94f234"
     },
     "include/ils_sp/pool.hpp": {
-      "archive_path": "cpp/include/ils_sp/pool.hpp",
-      "sha256": "05ff590df530d3cf57d3020b7d9ca81306ce19160c1132115c5cd073cd49b331"
+      "source_path": "cpp/include/ils_sp/pool.hpp",
+      "sha256": "05ff590df530d3cf57d3020b7d9ca81306ce19160c1132115c5cd073cd49b331",
+      "git_blob_sha": "78e555d281665ab55360abc55a249d48dc2291d8"
     },
     "include/ils_sp/search.hpp": {
-      "archive_path": "cpp/include/ils_sp/search.hpp",
-      "sha256": "21ec10a862333a13a9796cbc49356d015a85ce0db8e7692f4eef0050ba0f2614"
+      "source_path": "cpp/include/ils_sp/search.hpp",
+      "sha256": "a6f8b93712745662a90c0586acbf3300aeba215433519e60a5ddae3aa338fd69",
+      "git_blob_sha": "5ebe5a5499dbd11b9f69013c8d74445751f46dfb"
     },
     "include/ils_sp/solver.hpp": {
-      "archive_path": "cpp/include/ils_sp/solver.hpp",
-      "sha256": "39d06ab782ff26e912d7307af390359f7edc2055f494edbebe8b6863d34c7f13"
+      "source_path": "cpp/include/ils_sp/solver.hpp",
+      "sha256": "a9650ac1ef93b8d116e30af4770810016fe8017b84872683528fab5701f12062",
+      "git_blob_sha": "5b5fbf78efb17370b06946000c76d5bdafc170b8"
     },
     "include/ils_sp/xml.hpp": {
-      "archive_path": "cpp/include/ils_sp/xml.hpp",
-      "sha256": "468ae5e5d4a3f63c650f8dbb8b8a44cbba2721eaf1686c9f3488fd60e230a8c8"
+      "source_path": "cpp/include/ils_sp/xml.hpp",
+      "sha256": "468ae5e5d4a3f63c650f8dbb8b8a44cbba2721eaf1686c9f3488fd60e230a8c8",
+      "git_blob_sha": "7e2df62f6b3582ea06f59466228150ad419ddba6"
+    },
+    "src/bounded_rp_proxy.hpp": {
+      "source_path": "cpp/src/bounded_rp_proxy.hpp",
+      "sha256": "c8d0460c63ee5e28fdaf602127be9e2290e085731c48614c0f877b2a782fefe0",
+      "git_blob_sha": "83b8bd0761390e9d3959b70a85aa3fb8f97cac9a"
+    },
+    "src/bounded_rp_proxy.inc": {
+      "source_path": "cpp/src/bounded_rp_proxy.inc",
+      "sha256": "93d3e10a17ef123bd8ee07789d9d607e65db60d43eb89ae0dd99265895238035",
+      "git_blob_sha": "92f085adde2de4358b11a30cee70b3b38b927f48"
     },
     "src/catalog_disk_cache.inc": {
-      "archive_path": "cpp/src/catalog_disk_cache.inc",
-      "sha256": "542b395a399f1de85a21fc54d79f215cd650125350e88a63f3963dd5e3a31e88"
+      "source_path": "cpp/src/catalog_disk_cache.inc",
+      "sha256": "542b395a399f1de85a21fc54d79f215cd650125350e88a63f3963dd5e3a31e88",
+      "git_blob_sha": "9e589232fa6a86c6eb5fba8c5de6a105df9f3acf"
     },
     "src/copt_models.cpp": {
-      "archive_path": "cpp/src/copt_models.cpp",
-      "sha256": "f9fd9110b0f9f72787c871286c75648f7a9e437a8f734d8ed575571adee4b132"
+      "source_path": "cpp/src/copt_models.cpp",
+      "sha256": "9015cbde603e0fcfb1ab41600dd87f1cefd523f959aa969646c1a3c67329307f",
+      "git_blob_sha": "34ca22428aadd3d8a2b021c5a498d2e1bf49fcb2"
     },
     "src/core.cpp": {
-      "archive_path": "cpp/src/core.cpp",
-      "sha256": "0949c612db0ed3a5b69caa194e61e8f25e4b95f0f846263f27f51f8c52708d03"
+      "source_path": "cpp/src/core.cpp",
+      "sha256": "0949c612db0ed3a5b69caa194e61e8f25e4b95f0f846263f27f51f8c52708d03",
+      "git_blob_sha": "7b478cdb547dc76bbb04a192d48749814a9885d2"
     },
     "src/evaluator.cpp": {
-      "archive_path": "cpp/src/evaluator.cpp",
-      "sha256": "e8a6425b013dbbd6763eaea02978d5ccf78bfbecaff87d56ed7f66b44c45bce0"
+      "source_path": "cpp/src/evaluator.cpp",
+      "sha256": "db7e0597358073dd4e09feb5e9086f99769f5b62991713383aee8d2c33b2ed00",
+      "git_blob_sha": "a03ee29c32acff355b965861aef0ea1d703a2364"
     },
     "src/main.cpp": {
-      "archive_path": "cpp/src/main.cpp",
-      "sha256": "ce5dccdf504e7521b4bb13fd5093b3a101fb95984374c2b7e07af7279e439e4b"
+      "source_path": "cpp/src/main.cpp",
+      "sha256": "2c738e6dbe7794464d97b981fdbb06cabde2645badb9f0abf5157f5b42b8e770",
+      "git_blob_sha": "54d8f4882bc9b7b13e8c30759954aceb08821ce3"
     },
     "src/pool.cpp": {
-      "archive_path": "cpp/src/pool.cpp",
-      "sha256": "ca38df0d8634b632bfca4c215aec0e1afe71d2c8f80d1f5799967664bcc4c142"
+      "source_path": "cpp/src/pool.cpp",
+      "sha256": "ca38df0d8634b632bfca4c215aec0e1afe71d2c8f80d1f5799967664bcc4c142",
+      "git_blob_sha": "1ae5a05b2ddf6df31c0fbba0144a9238ed1c0918"
+    },
+    "src/route_opening_rp_reserve.hpp": {
+      "source_path": "cpp/src/route_opening_rp_reserve.hpp",
+      "sha256": "60d030b1e0aa7f408f28b95f38a6155d32a363d9ec15cdd4c5feca589cb5318e",
+      "git_blob_sha": "106220d4b7b24311f621ae76e2dbd70b4323f1fd"
     },
     "src/search.cpp": {
-      "archive_path": "cpp/src/search.cpp",
-      "sha256": "3df57e8ddc7a645e09dfa1064b89d79b71b29f85b5410fb80a0d3ab9abadebc7"
+      "source_path": "cpp/src/search.cpp",
+      "sha256": "4b516cf2191ea474cd6fd1ad343aa6b59e9f5b487b4563135ca9c48d7ec4da79",
+      "git_blob_sha": "bffbc9192f24e29e3408735484b0d497ed8ba8bc"
     },
     "src/solver.cpp": {
-      "archive_path": "cpp/src/solver.cpp",
-      "sha256": "1bd73f5df79213a78c566b35e1c355e3496ad3b82fd449e3a5019b37c260f9cb"
+      "source_path": "cpp/src/solver.cpp",
+      "sha256": "7582771d122e7860a6661362cb4364da3dff8773b19feb9789dfc6adec4d6552",
+      "git_blob_sha": "b595e1e4cc9ae2b9c68150094aa539225dced460"
     },
     "src/xml.cpp": {
-      "archive_path": "cpp/src/xml.cpp",
-      "sha256": "aa705fb98d74bcab8aadfe44837da0c8d3bc6b7052b73a0c5d12253de7c4be4f"
+      "source_path": "cpp/src/xml.cpp",
+      "sha256": "aa705fb98d74bcab8aadfe44837da0c8d3bc6b7052b73a0c5d12253de7c4be4f",
+      "git_blob_sha": "ad4c559e28d19b17680dc14fdb9c378508d61470"
     },
     "src/main_with_schedule.cpp": {
-      "archive_path": "validation_source/main_with_schedule.cpp",
-      "sha256": "ce19a5550f3afea700631b1203f39d245ff82dda9a32d2037d892179f9e44a53"
+      "source_path": "validation_source/main_with_schedule.cpp",
+      "sha256": "2aa636ee962183a2a0847f4f4506cb3738aa0e72dc1511058657b321b4dd503c",
+      "git_blob_sha": "6209e4e40ae05e77787fa1db6ba9496dc547874d"
     },
     "src/schedule_certificate.hpp": {
-      "archive_path": "validation_source/schedule_certificate.hpp",
-      "sha256": "512dcae37873ec43d5d83bba47b80a3b11a159c07f95aa037df97d4609b4b0e9"
+      "source_path": "validation_source/schedule_certificate.hpp",
+      "sha256": "512dcae37873ec43d5d83bba47b80a3b11a159c07f95aa037df97d4609b4b0e9",
+      "git_blob_sha": "d2843723ac9af94f95a845a5021db67654e391c0"
     }
-  },
-  "notes": [
-    "Core and frontend file bytes are unchanged from the frozen source archive; only repository paths were mapped.",
-    "Build metadata and README are adapted to the existing repository layout.",
-    "A locally rebuilt executable has a new identity; do not assign it the historical binary hash."
-  ]
+  }
 }

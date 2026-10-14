@@ -1,6 +1,11 @@
 #include "ils_sp/solver.hpp"
+#include "ils_sp/detail/input_contract.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -10,6 +15,52 @@ namespace ils_sp {
 namespace {
 
 using SolverClock = std::chrono::steady_clock;
+
+bool same_complete_workstate(const Solution& left, const Solution& right) {
+  if (left.plans.size() != right.plans.size()) return false;
+  const auto same_double = [](double a, double b) {
+    return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
+  };
+  const auto same_values = [&](const std::vector<double>& a,
+                               const std::vector<double>& b) {
+    return a.size() == b.size() &&
+        std::equal(a.begin(), a.end(), b.begin(), same_double);
+  };
+  for (std::size_t i = 0; i < left.plans.size(); ++i) {
+    const Plan& a = left.plans[i];
+    const Plan& b = right.plans[i];
+    if (a.route != b.route || a.customer_ids != b.customer_ids ||
+        a.gaps != b.gaps || a.exact_charging != b.exact_charging) return false;
+    // RouteEvaluation is immutable. The same live certificate implies value
+    // equality, while distinct certificates are compared field by field.
+    if (a.evaluation == b.evaluation) continue;
+    if (!a.evaluation || !b.evaluation) return false;
+    const RouteEvaluation& x = *a.evaluation;
+    const RouteEvaluation& y = *b.evaluation;
+    if (x.route != y.route || x.feasible != y.feasible ||
+        !same_double(x.raw_cost_h, y.raw_cost_h) ||
+        !same_double(x.travel_time_h, y.travel_time_h) ||
+        !same_double(x.charging_time_h, y.charging_time_h) ||
+        !same_double(x.service_time_h, y.service_time_h) ||
+        !same_double(x.route_duration_h, y.route_duration_h) ||
+        !same_double(x.energy_shortfall_wh, y.energy_shortfall_wh) ||
+        !same_double(x.duration_excess_h, y.duration_excess_h) ||
+        !same_values(x.arrival_energy_wh, y.arrival_energy_wh) ||
+        !same_values(x.departure_energy_wh, y.departure_energy_wh) ||
+        x.charging_events.size() != y.charging_events.size()) return false;
+    for (std::size_t j = 0; j < x.charging_events.size(); ++j) {
+      const ChargingEvent& p = x.charging_events[j];
+      const ChargingEvent& q = y.charging_events[j];
+      if (p.visit_index != q.visit_index || p.station_id != q.station_id ||
+          !same_double(p.arrival_energy_wh, q.arrival_energy_wh) ||
+          !same_double(p.departure_energy_wh, q.departure_energy_wh) ||
+          !same_double(p.duration_h, q.duration_h)) return false;
+    }
+  }
+  return true;
+}
+
+
 
 // SP-feedback/HLNS-inspired interpretation, not specified TRC acceptance.
 bool improve_epoch_anchor(const Solution& candidate,
@@ -187,6 +238,17 @@ IlsSpSolver::IlsSpSolver(const Instance& instance, Envr& environment,
              config_.infeasible_cache_capacity),
       penalty_lambda_(config_.paper.lambda_initial) {
   const PaperParameters& paper = config_.paper;
+  if (config_.global_time_limit_s) {
+    (void)detail::checked_deadline_after<SolverClock>(
+        SolverClock::now(), *config_.global_time_limit_s);
+  }
+  if (config_.sp_maximum_time_s) {
+    (void)detail::checked_deadline_after<SolverClock>(
+        SolverClock::now(), *config_.sp_maximum_time_s);
+  }
+  if (config_.rounded_target_objective_h) {
+    detail::validate_rounded_target(*config_.rounded_target_objective_h);
+  }
   if ((config_.rebuild_initialization_paths || config_.preserve_initialization_station_visits) &&
       (config_.search_profile != SearchProfile::Paper ||
        !config_.complete_initialization_paths.value_or(false))) {
@@ -204,6 +266,12 @@ IlsSpSolver::IlsSpSolver(const Instance& instance, Envr& environment,
   if (config_.preserve_station_visits &&
       config_.complete_insertion_paths.value_or(false)) {
     throw std::invalid_argument("preserve-cs cannot use completed insertion");
+  }
+  if (config_.search_profile == SearchProfile::Paper &&
+      config_.preserve_station_visits && !config_.implicit_replace_path &&
+      !config_.project_opening_station_visits) {
+    throw std::invalid_argument(
+        "cooperative preserve-cs requires projected route opening");
   }
   if (paper.penalty_window == 0 || !std::isfinite(paper.penalty_factor) ||
       !std::isfinite(paper.lambda_min) || !std::isfinite(paper.lambda_initial) ||
@@ -275,6 +343,7 @@ bool IlsSpSolver::pool_covers_all_customers(
 bool IlsSpSolver::rounded_target_reached(const Solution& candidate) const {
   return config_.rounded_target_objective_h.has_value() &&
          candidate.feasible() &&
+         detail::roundable_objective(candidate.raw_cost_h()) &&
          std::llround(candidate.raw_cost_h() * 100.0) <=
              std::llround(*config_.rounded_target_objective_h * 100.0);
 }
@@ -429,8 +498,18 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
           .incumbent_stall_limit_s =
               config_.sp_incumbent_stall_limit_s,
           .maximum_wall_time_s = config_.sp_maximum_time_s,
-          .progress = std::move(model_progress)});
+          .progress = std::move(model_progress),
+          .allow_lp_certificate = config_.search_profile == SearchProfile::Paper});
   sp_model_runtime_s_ += partition.runtime_s;
+  sp_lp_prepass_calls_ += partition.lp_prepass_attempted;
+  sp_lp_certified_calls_ += partition.lp_certified_start;
+  sp_lp_fallback_calls_ += partition.lp_prepass_attempted && !partition.lp_certified_start;
+  sp_lp_exception_calls_ += partition.lp_prepass_exception;
+  lp_calls_ += partition.lp_prepass_exception;  // Failed prepass plus later original LP retry.
+  sp_lp_prepass_wall_s_ += partition.lp_prepass_wall_s;
+  sp_rc_fixing_calls_ += !partition.lp_certificate.fixed_zero_columns.empty();
+  sp_rc_fixed_columns_ += partition.lp_certificate.fixed_zero_columns.size();
+  sp_rc_considered_columns_ += partition.lp_certificate.fixing_columns_considered;
   if (!partition.selected_columns.empty()) {
     previous_sp_customer_sets_.clear();
     previous_sp_customer_sets_.reserve(partition.selected_columns.size());
@@ -455,6 +534,13 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
     checkpoint.mip_start_objective_h = partition.mip_start_objective_h;
     checkpoint.status = partition.status;
     checkpoint.status_name = partition.status_name;
+    checkpoint.lp_prepass_wall_s = partition.lp_prepass_wall_s;
+    checkpoint.rc_fixed_columns = partition.lp_certificate.fixed_zero_columns.size();
+    checkpoint.rc_considered_columns = partition.lp_certificate.fixing_columns_considered;
+    if (partition.lp_certificate.valid) {
+      checkpoint.certificate_gap_upper_h = partition.lp_certificate.gap_upper_h;
+      checkpoint.certificate_acceptance_gap_h = partition.lp_certificate.acceptance_gap_h;
+    }
     checkpoint.mip_start_source = mip_start.source;
     checkpoint.sp_trigger_source =
         adaptive_sp && !periodic_sp ? "pool_stall" : "frequency";
@@ -498,8 +584,9 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
   }
 
   ++lp_calls_;
-  LinearRelaxationResult relaxation =
-      set_partitioning_.solve_relaxation(columns, deadline);
+  LinearRelaxationResult relaxation = partition.reused_relaxation
+      ? std::move(*partition.reused_relaxation)
+      : set_partitioning_.solve_relaxation(columns, deadline);
   lp_model_runtime_s_ += relaxation.runtime_s;
   if (exact_progress) {
     ExactStageProgress checkpoint;
@@ -513,6 +600,7 @@ std::optional<Solution> IlsSpSolver::assemble_routes(
     checkpoint.objective_h = relaxation.objective_h;
     checkpoint.status = relaxation.status;
     checkpoint.status_name = relaxation.status_name;
+    checkpoint.lp_reused_prepass = partition.reused_relaxation.has_value();
     checkpoint.model_runtime_s = relaxation.runtime_s;
     checkpoint.wall_runtime_s = relaxation.wall_runtime_s;
     checkpoint.model_size = relaxation.model_size;
@@ -670,10 +758,8 @@ SolverResult IlsSpSolver::solve(
   detail::FrvcpActiveWallBudget frvcp_budget(config_.frvcp_active_wall_budget_s);
   const auto deadline = config_.global_time_limit_s.has_value()
                             ? std::optional<SolverClock::time_point>(
-                                  started + std::chrono::duration_cast<
-                                                SolverClock::duration>(
-                                                std::chrono::duration<double>(
-                                                    *config_.global_time_limit_s)))
+                                  detail::checked_deadline_after<SolverClock>(
+                                      started, *config_.global_time_limit_s))
                             : std::nullopt;
   Solution current = initial_builder_.build(penalty_lambda_);
   // Keep a feasible answer available without changing Algorithm 1's empty
@@ -685,6 +771,13 @@ SolverResult IlsSpSolver::solve(
   const bool cooperative_mode = config_.search_profile == SearchProfile::Paper &&
       config_.preserve_station_visits && !config_.implicit_replace_path;
   // Frozen TRC caller-state interpretation: no added epoch/anchor controller.
+  // Experimental nonrecord continuation: a fixed, same-lambda VND endpoint
+  // is the return anchor. Initialization itself is never an anchor.
+  const bool fixed_anchor_mode = continue_from_record && cooperative_mode;
+  std::optional<Solution> return_anchor;
+  double return_anchor_lambda = 0.0;
+  std::size_t p_carry_decisions = 0, cumulative_p_steps = 0, max_cumulative_p_steps = 0;
+  std::size_t different_l_resets = 0, lambda_resets = 0, record_resets = 0;
   constexpr bool epoch_mode = false;
   // Independent search anchor; the output-only fallback is never read here.
   std::optional<Solution> epoch_anchor;
@@ -837,9 +930,16 @@ SolverResult IlsSpSolver::solve(
       break;
     }
     const auto perturbation_started = SolverClock::now();
+    const double iteration_lambda = penalty_lambda_;
     Solution perturbed = perturbation_.apply(current, penalty_lambda_);
-    // Primary Algorithm 2 interpretation: cooperative perturbed S is local;
-    // retain historical shared-input semantics only for other profiles.
+    // Preserve the raw path only while an actual previous VND endpoint exists.
+    // This copy is required even for a physical no-op at a non-anchor W.
+    std::optional<Solution> raw_perturbation;
+    if (fixed_anchor_mode && return_anchor) raw_perturbation = perturbed;
+    bool pending_p_carry = false;
+    // Alternative Algorithm 2 interpretation for the cooperative profile:
+    // carry its returned VND work state below; legacy record mode keeps P.
+    // Assembler/global-record acceptance remains independent and unchanged.
     if (continue_from_record && !cooperative_mode) current = perturbed;
     const double perturbation_s =
         elapsed_seconds(perturbation_started, SolverClock::now());
@@ -856,12 +956,47 @@ SolverResult IlsSpSolver::solve(
     Solution local = vnd_.improve(std::move(perturbed), penalty_lambda_, deadline,
                                  cooperative_removal_count);
     if (epoch_mode && exploring) ++exploration_iterations;
-    if (cooperative_mode && (!continue_from_record || exploring)) current = local;
+    if (fixed_anchor_mode) {
+      // A deadline-aborted descent cannot establish an anchor. The default
+      // fixed-iteration profile has no deadline and makes no extra clock read.
+      const bool completed_vnd = !deadline || SolverClock::now() < *deadline;
+      if (!completed_vnd) {
+        current = local;
+        return_anchor.reset();
+        cumulative_p_steps = 0;
+      } else if (return_anchor &&
+                 std::bit_cast<std::uint64_t>(return_anchor_lambda) ==
+                     std::bit_cast<std::uint64_t>(iteration_lambda) &&
+                 same_complete_workstate(*return_anchor, local)) {
+        current = std::move(*raw_perturbation);
+        pending_p_carry = true;
+      } else {
+        if (return_anchor) ++different_l_resets;
+        current = local;
+        return_anchor = local;
+        return_anchor_lambda = iteration_lambda;
+        cumulative_p_steps = 0;
+      }
+    } else if (cooperative_mode) {
+      current = local;
+    }
+    raw_perturbation.reset();
     const double vnd_s = elapsed_seconds(vnd_started, SolverClock::now());
     vnd_runtime_s += vnd_s;
     interval_vnd_s += vnd_s;
 
     observe_penalty(local.feasible());
+    if (fixed_anchor_mode &&
+        std::bit_cast<std::uint64_t>(penalty_lambda_) !=
+            std::bit_cast<std::uint64_t>(iteration_lambda)) {
+      // L was produced under the old lambda. Carry L but do not call it a
+      // new-lambda endpoint until a later VND has actually run at that lambda.
+      if (return_anchor) ++lambda_resets;
+      current = local;
+      return_anchor.reset();
+      cumulative_p_steps = 0;
+      pending_p_carry = false;
+    }
     // The historical operational experiment also records local before SP.
     // The paper policy records only the complete assembler return below.
     if (!continue_from_record) record_candidate(local, iteration);
@@ -881,6 +1016,12 @@ SolverResult IlsSpSolver::solve(
         if (continue_from_record) {
           if (record_candidate(*assembled, iteration)) {
             current = std::move(*assembled);
+            if (fixed_anchor_mode) {
+              if (return_anchor) ++record_resets;
+              return_anchor.reset();
+              cumulative_p_steps = 0;
+              pending_p_carry = false;
+            }
           }
         } else {
           current = std::move(*assembled);
@@ -897,6 +1038,13 @@ SolverResult IlsSpSolver::solve(
       if (target_before_assembly) iterations = iteration;
     }
 
+    // Count only carries that survive both penalty feedback and record update.
+    // Counts include self-loops: a raw perturbation can itself be a no-op.
+    if (pending_p_carry) {
+      ++p_carry_decisions;
+      ++cumulative_p_steps;
+      max_cumulative_p_steps = std::max(max_cumulative_p_steps, cumulative_p_steps);
+    }
     const bool deadline_reached =
         deadline.has_value() && SolverClock::now() >= *deadline;
     const bool target_reached =
@@ -1059,8 +1207,33 @@ SolverResult IlsSpSolver::solve(
       uncovered_customers.push_back(customer);
     }
   }
-  if (best.has_value()) initialization_fallback.reset();
+  // Output-only selection after all search decisions and pool diagnostics.
+  // Keep a strictly better feasible initialization certificate even when a
+  // worse search record exists. Search best/current/records remain untouched.
+  if (best.has_value() && initialization_fallback.has_value() &&
+      !(initialization_fallback->raw_cost_h() <
+        best->raw_cost_h() - kCostTolerance)) {
+    initialization_fallback.reset();
+  }
   const double runtime = elapsed_seconds(started, SolverClock::now());
+  if (fixed_anchor_mode) {
+    std::ostringstream o;
+    o << std::setprecision(17)
+      << "fixed_anchor_summary p_carry_decisions=" << p_carry_decisions
+      << " max_cumulative_p_steps=" << max_cumulative_p_steps
+      << " different_l_resets=" << different_l_resets
+      << " lambda_resets=" << lambda_resets << " record_resets=" << record_resets
+      << " final_lambda=" << penalty_lambda_ << " physical_only=1 final_working_visits=";
+    for (std::size_t r = 0; r < current.plans.size(); ++r) {
+      if (r) o << '|'; o << '[';
+      const auto& visits = current.plans[r].route.visits;
+      for (std::size_t i = 0; i < visits.size(); ++i) { if (i) o << ','; o << visits[i]; }
+      o << ']';
+    }
+    const auto line = o.str();
+    if (std::fprintf(stderr, "%s\n", line.c_str()) < 0 || std::fflush(stderr) != 0)
+      throw std::runtime_error("failed to write fixed-anchor summary");
+  }
   return SolverResult{
       .best_solution = std::move(best),
       .initialization_fallback = std::move(initialization_fallback),
@@ -1079,6 +1252,14 @@ SolverResult IlsSpSolver::solve(
       .sp_skipped_incomplete_pool = sp_skipped_incomplete_pool_,
       .adaptive_sp_calls = adaptive_sp_calls_,
       .lp_calls = lp_calls_,
+      .sp_lp_prepass_calls = sp_lp_prepass_calls_,
+      .sp_lp_certified_calls = sp_lp_certified_calls_,
+      .sp_lp_fallback_calls = sp_lp_fallback_calls_,
+      .sp_lp_exception_calls = sp_lp_exception_calls_,
+      .sp_lp_prepass_wall_s = sp_lp_prepass_wall_s_,
+      .sp_rc_fixing_calls = sp_rc_fixing_calls_,
+      .sp_rc_fixed_columns = sp_rc_fixed_columns_,
+      .sp_rc_considered_columns = sp_rc_considered_columns_,
       .frvcp_calls = frvcp_calls_,
       .frvcp_solve_calls = frvcp_.solve_calls(),
       .frvcp_cache_hits = frvcp_.cache_hits(),

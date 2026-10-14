@@ -1,12 +1,45 @@
 #include "ils_sp/evaluator.hpp"
 
 #include <array>
+#include <bit>
+#include <cstdio>
 #include <limits>
 #include <new>
 #include <numeric>
 #include <stdexcept>
 
 namespace ils_sp {
+
+namespace {
+// Deliberate evaluation semantics for a degenerate W=0 input, not an
+// Algorithm-3 arithmetic optimization. Raw routes, slots and keys stay intact.
+// This Instance model has no visit fee, waiting time or time-dependent queue.
+// Require strict finite curve points and zero node service/self travel before
+// quotienting an adjacent run. Unsupported cases retain the original kernel.
+bool canonical_same_station_supported(const Instance& instance, int id) {
+  const Node& node = instance.node(id);
+  if (node.kind != NodeKind::Station || node.service_time_h != 0.0 ||
+      instance.travel_time_h(id, id) != 0.0 ||
+      instance.energy_wh(id, id) != 0.0) return false;
+  const auto& points = instance.curve_for_station(id).points();
+  if (points.size() < 2) return false;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    if (!std::isfinite(points[i].time_h) ||
+        !std::isfinite(points[i].energy_wh)) return false;
+    if (i && (!(points[i].time_h > points[i-1].time_h) ||
+              !(points[i].energy_wh > points[i-1].energy_wh))) return false;
+  }
+  return true;
+}
+
+bool mergeable_leg(const Instance& instance, const ChargingSequenceLeg& prior,
+                   const ChargingSequenceLeg& leg) {
+  return leg.physical_same_station_predecessor &&
+         prior.station_id == leg.station_id &&
+         leg.energy_from_previous_station_wh == 0.0 &&
+         canonical_same_station_supported(instance, leg.station_id);
+}
+}  // namespace
 
 const ChargingCurve& NonlinearSequenceEvaluator::station_curve(
     int station_id) const {
@@ -71,7 +104,8 @@ ChargingSequenceLabel NonlinearSequenceEvaluator::edge_label(
     if (charging_opportunity) {
       label.station_legs.push_back(ChargingSequenceLeg{
           .station_id = node_id,
-          .energy_from_previous_station_wh = accumulated_energy});
+          .energy_from_previous_station_wh = accumulated_energy,
+          .physical_same_station_predecessor = prior == node_id});
       accumulated_energy = 0.0;
     }
     prior = node_id;
@@ -219,6 +253,63 @@ RouteCostSummary NonlinearSequenceEvaluator::evaluate(
       tail_energy_wh);
 }
 
+RouteCostSummary NonlinearSequenceEvaluator::evaluate(
+    std::span<const ChargingSequenceView> components) const {
+  if (components.empty()) {
+    throw std::invalid_argument("cannot evaluate an empty sequence label");
+  }
+  std::size_t station_count = 0;
+  double travel_time_h = 0.0;
+  double service_time_h = 0.0;
+  const ChargingSequenceView* previous = nullptr;
+  for (const ChargingSequenceView& value : components) {
+    const auto* component = &value;
+    if (!component->initialized) {
+      throw std::invalid_argument("sequence contains an empty component");
+    }
+    if (previous != nullptr &&
+        previous->target_id != component->origin_id) {
+      throw std::invalid_argument("non-contiguous charging sequence labels");
+    }
+    station_count += component->station_legs.size();
+    travel_time_h += component->travel_time_h;
+    service_time_h += component->service_time_h;
+    previous = component;
+  }
+
+  constexpr std::size_t kInlineStations = 64;
+  std::array<ChargingSequenceLeg, kInlineStations> inline_legs;
+  std::vector<ChargingSequenceLeg> large_legs;
+  if (station_count > kInlineStations) large_legs.resize(station_count);
+  ChargingSequenceLeg* const station_legs =
+      station_count <= kInlineStations ? inline_legs.data()
+                                       : large_legs.data();
+  std::size_t station_index = 0;
+  double tail_energy_wh = 0.0;
+  for (const ChargingSequenceView& value : components) {
+    const auto* component = &value;
+    if (component->station_legs.empty()) {
+      tail_energy_wh += component->tail_energy_wh;
+      continue;
+    }
+    station_legs[station_index] = component->station_legs.front();
+    station_legs[station_index].energy_from_previous_station_wh =
+        component->first_energy_wh;
+    station_legs[station_index].energy_from_previous_station_wh +=
+        tail_energy_wh;
+    ++station_index;
+    for (std::size_t index = 1; index < component->station_legs.size();
+         ++index) {
+      station_legs[station_index++] = component->station_legs[index];
+    }
+    tail_energy_wh = component->tail_energy_wh;
+  }
+  return evaluate_data<false>(
+      travel_time_h, service_time_h,
+      std::span<const ChargingSequenceLeg>{station_legs, station_count},
+      tail_energy_wh);
+}
+
 template <bool Bounded>
 std::conditional_t<Bounded, NonlinearSequenceEvaluator::BoundedEvaluation,
                    RouteCostSummary>
@@ -227,6 +318,22 @@ NonlinearSequenceEvaluator::evaluate_data(
     std::span<const ChargingSequenceLeg> station_legs,
     double tail_energy_wh,
     std::conditional_t<Bounded, BoundedLimits, std::monostate> limits) const {
+  // Retain every raw leg until this evaluation boundary. A customer between
+  // equal station IDs makes the second leg's physical adjacency flag false,
+  // even if that customer's service/travel/energy happen to be zero.
+  std::vector<ChargingSequenceLeg> canonical_legs;
+  for (std::size_t i = 1; i < station_legs.size(); ++i) {
+    if (!mergeable_leg(instance_, station_legs[i-1], station_legs[i])) continue;
+    canonical_legs.reserve(station_legs.size());
+    canonical_legs.insert(canonical_legs.end(), station_legs.begin(),
+                          station_legs.begin() + i);
+    for (std::size_t j = i; j < station_legs.size(); ++j) {
+      if (!mergeable_leg(instance_, canonical_legs.back(), station_legs[j]))
+        canonical_legs.push_back(station_legs[j]);
+    }
+    station_legs = canonical_legs;
+    break;
+  }
   const double capacity = instance_.vehicle().battery_capacity_wh;
   const std::size_t station_count = station_legs.size();
   const double no_charge_duration_h = travel_time_h + service_time_h;
@@ -598,6 +705,53 @@ std::shared_ptr<const RouteEvaluation> RouteEvaluator::evaluate_schedule(
 }
 
 RouteEvaluation RouteEvaluator::evaluate_uncached(const Route& route) const {
+  bool has_run = false;
+  for (std::size_t i = 1; i < route.visits.size(); ++i) {
+    if (route.visits[i] == route.visits[i-1] &&
+        canonical_same_station_supported(instance_, route.visits[i])) {
+      has_run = true;
+      break;
+    }
+  }
+  if (has_run) {
+    Route canonical;
+    canonical.visits.reserve(route.visits.size());
+    std::vector<std::size_t> raw_to_canonical(route.visits.size());
+    std::vector<std::size_t> last_raw;
+    last_raw.reserve(route.visits.size());
+    for (std::size_t i = 0; i < route.visits.size(); ++i) {
+      const int id = route.visits[i];
+      if (i && id == route.visits[i-1] &&
+          canonical_same_station_supported(instance_, id)) {
+        last_raw.back() = i;
+      } else {
+        canonical.visits.push_back(id);
+        last_raw.push_back(i);
+      }
+      raw_to_canonical[i] = canonical.visits.size()-1;
+    }
+    // No supported adjacent duplicates remain, so recursion enters the old
+    // numerical kernel exactly once. Do not publish a second cache entry.
+    RouteEvaluation compact = evaluate_uncached(canonical);
+    RouteEvaluation lifted = compact;
+    lifted.route = route;
+    lifted.arrival_energy_wh.resize(route.visits.size()+2);
+    lifted.departure_energy_wh.resize(route.visits.size()+2);
+    lifted.arrival_energy_wh.front() = compact.arrival_energy_wh.front();
+    lifted.departure_energy_wh.front() = compact.departure_energy_wh.front();
+    for (std::size_t i = 0; i < route.visits.size(); ++i) {
+      const std::size_t group = raw_to_canonical[i];
+      const double arrival = compact.arrival_energy_wh[group+1];
+      lifted.arrival_energy_wh[i+1] = arrival;
+      lifted.departure_energy_wh[i+1] = i == last_raw[group]
+          ? compact.departure_energy_wh[group+1] : arrival;
+    }
+    lifted.arrival_energy_wh.back() = compact.arrival_energy_wh.back();
+    lifted.departure_energy_wh.back() = compact.departure_energy_wh.back();
+    for (auto& event : lifted.charging_events)
+      event.visit_index = last_raw[event.visit_index];
+    return lifted;
+  }
   const int depot_id = instance_.depot().id;
   std::vector<int> path;
   path.reserve(route.visits.size() + 2);
@@ -778,6 +932,25 @@ PlanFactory::PlanFactory(const Instance& instance, RouteEvaluator& evaluator,
       exact_cache_(exact_cache_capacity),
       allow_inherited_station_revisits_(allow_inherited_station_revisits) {}
 
+bool PlanFactory::has_adjacent_station_visits(std::span<const int> visits) const {
+  for(std::size_t i=1;i<visits.size();++i)
+    if(visits[i]==visits[i-1]&&instance_.node(visits[i]).kind==NodeKind::Station)return true;
+  return false;
+}
+
+bool PlanFactory::normalize_adjacent_station_visits(std::vector<int>& visits) const {
+  std::size_t kept=0;
+  for(const int id:visits) {
+    if(kept&&visits[kept-1]==id&&instance_.node(id).kind==NodeKind::Station) {
+      if(!canonical_same_station_supported(instance_,id))
+        throw std::invalid_argument("adjacent identical stations violate the raw representation policy; unsupported normalization");
+      continue;
+    }
+    visits[kept++]=id;
+  }
+  const bool changed=kept!=visits.size();visits.resize(kept);return changed;
+}
+
 void PlanFactory::validate_node_sequence(std::span<const int> ids,
                                          NodeKind kind, const char* error) {
   if (ids.empty()) return;
@@ -849,6 +1022,18 @@ Plan PlanFactory::plan_visits(std::vector<int> visits) {
 Plan PlanFactory::assemble_plan(std::vector<int> customer_ids,
                                 std::vector<std::vector<int>> gaps,
                                 Route route) {
+  if(normalize_adjacent_station_visits(route.visits)) {
+    gaps=direct_gaps(customer_ids.size());std::size_t gap=0;
+    for(int id:route.visits) {
+      if(instance_.node(id).kind==NodeKind::Station)gaps.at(gap).push_back(id);
+      else {
+        if(gap>=customer_ids.size()||customer_ids[gap]!=id)
+          throw std::logic_error("normalized physical plan changed its customer order");
+        ++gap;
+      }
+    }
+    if(gap!=customer_ids.size())throw std::logic_error("normalized physical plan lost a customer");
+  }
   auto evaluation = evaluator_.evaluate(route);
   return Plan{.customer_ids = std::move(customer_ids),
               .gaps = std::move(gaps),
@@ -913,6 +1098,10 @@ void PlanFactory::publish_exact(Plan plan) {
       !plan.evaluation->feasible) {
     throw std::invalid_argument("exact cache only accepts feasible exact plans");
   }
+  if(has_adjacent_station_visits(plan.route.visits)) {
+    std::fputs("exact_plan_publication_rejected reason=adjacent_identical_station raw_certificate_unchanged=1\n",stderr);
+    return; // Keep any existing exact-cache incumbent; never rewrite a certificate.
+  }
   const std::vector<int> customer_key = plan.customer_ids;
   exact_cache_.put(customer_key, std::move(plan));
 }
@@ -944,13 +1133,116 @@ PhysicalRouteScorer::PhysicalRouteScorer(const Instance& instance,
   }
   prefixes_.resize(nodes_.size());
   suffixes_.resize(nodes_.size());
+  prefix_station_legs_.reserve(nodes_.size());
   for (std::size_t index = 0; index < edges.size(); ++index) {
-    prefixes_[index + 1] =
-        evaluator_.concatenate(prefixes_[index], edges[index]);
+    const auto& edge = edges[index];
+    const auto& prior = prefixes_[index];
+    auto& next = prefixes_[index + 1];
+    next.initialized = true;
+    next.origin_id = prior.initialized ? prior.origin_id : edge.origin_id;
+    next.target_id = edge.target_id;
+    next.travel_time_h = prior.initialized
+        ? prior.travel_time_h + edge.travel_time_h : edge.travel_time_h;
+    next.service_time_h = prior.initialized
+        ? prior.service_time_h + edge.service_time_h : edge.service_time_h;
+    if (!edge.station_legs.empty()) {
+      auto leg = edge.station_legs.front();
+      if (prior.initialized)
+        leg.energy_from_previous_station_wh += prior.tail_energy_wh;
+      prefix_station_legs_.push_back(leg); // A physical edge has at most one CS.
+      next.tail_energy_wh = edge.tail_energy_wh;
+    } else {
+      next.tail_energy_wh = prior.initialized
+          ? prior.tail_energy_wh + edge.tail_energy_wh : edge.tail_energy_wh;
+    }
+    next.station_legs = std::span<const ChargingSequenceLeg>{prefix_station_legs_};
+    if (!next.station_legs.empty())
+      next.first_energy_wh = next.station_legs.front().energy_from_previous_station_wh;
   }
+  // For a suffix, concatenation adds the preceding edge's tail to its first
+  // leg, from right to left. Store that first value per view; interior legs
+  // become immutable as soon as the preceding station is crossed.
+  suffix_station_legs_.resize(prefix_station_legs_.size());
+  std::size_t first_station = suffix_station_legs_.size();
   for (std::size_t index = edges.size(); index-- > 0;) {
-    suffixes_[index] =
-        evaluator_.concatenate(edges[index], suffixes_[index + 1]);
+    const auto& edge = edges[index];
+    const auto& after = suffixes_[index + 1];
+    auto& next = suffixes_[index];
+    next.initialized = true;
+    next.origin_id = edge.origin_id;
+    next.target_id = after.initialized ? after.target_id : edge.target_id;
+    next.travel_time_h = after.initialized
+        ? edge.travel_time_h + after.travel_time_h : edge.travel_time_h;
+    next.service_time_h = after.initialized
+        ? edge.service_time_h + after.service_time_h : edge.service_time_h;
+    if (!after.station_legs.empty()) {
+      double first_energy = after.first_energy_wh;
+      first_energy += edge.tail_energy_wh;
+      suffix_station_legs_[first_station].energy_from_previous_station_wh = first_energy;
+      next.tail_energy_wh = after.tail_energy_wh;
+    } else {
+      next.tail_energy_wh = after.initialized
+          ? edge.tail_energy_wh + after.tail_energy_wh : edge.tail_energy_wh;
+    }
+    if (!edge.station_legs.empty())
+      suffix_station_legs_[--first_station] = edge.station_legs.front();
+    next.station_legs = std::span<const ChargingSequenceLeg>{suffix_station_legs_}
+        .subspan(first_station);
+    if (!next.station_legs.empty())
+      next.first_energy_wh = next.station_legs.front().energy_from_previous_station_wh;
+  }
+  // Certify once in O(V). Each accepted neighboring pair differs only by
+  // moving one zero-length same-station leg from suffix to prefix; the
+  // canonical numerical kernel then receives exactly the same bit sequence.
+  // Every uncertainty falls back to its own representative, with no reuse.
+  insertion_score_representatives_.resize(nodes_.size()-1);
+  std::iota(insertion_score_representatives_.begin(),
+            insertion_score_representatives_.end(), std::size_t{0});
+  const auto same_bits = [](double a, double b) {
+    return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
+  };
+  const auto same_scalars = [&](const ChargingSequenceView& a,
+                                const ChargingSequenceView& b) {
+    return a.initialized && b.initialized &&
+        a.origin_id == b.origin_id && a.target_id == b.target_id &&
+        same_bits(a.travel_time_h, b.travel_time_h) &&
+        same_bits(a.service_time_h, b.service_time_h) &&
+        same_bits(a.tail_energy_wh, b.tail_energy_wh);
+  };
+  const auto equivalent_pair = [&](std::size_t q, int station) {
+    const std::size_t p = q-1;
+    const auto& lp = prefixes_[p]; const auto& lq = prefixes_[q];
+    const auto& rp = suffixes_[p+1]; const auto& rq = suffixes_[q+1];
+    if (!same_scalars(lp,lq) || !same_scalars(rp,rq) ||
+        lp.station_legs.empty() ||
+        lq.station_legs.size() != lp.station_legs.size()+1 ||
+        lq.station_legs.data() != lp.station_legs.data() ||
+        !same_bits(lp.first_energy_wh,lq.first_energy_wh) ||
+        rp.station_legs.size() != rq.station_legs.size()+1 ||
+        rp.station_legs.data()+1 != rq.station_legs.data()) return false;
+    const auto& added = lq.station_legs.back();
+    const auto& removed = rp.station_legs.front();
+    if (lp.station_legs.back().station_id != station ||
+        added.station_id != station || !added.physical_same_station_predecessor ||
+        !same_bits(added.energy_from_previous_station_wh,0.0) ||
+        removed.station_id != station || !removed.physical_same_station_predecessor ||
+        !same_bits(rp.first_energy_wh,0.0)) return false;
+    // Suffix first-leg energies are overrides, not necessarily backing values.
+    // All remaining entries alias the same immutable array after this check.
+    return rq.station_legs.empty() || same_bits(rq.first_energy_wh,
+        rp.station_legs[1].energy_from_previous_station_wh);
+  };
+  for (std::size_t begin = 1; begin+1 < nodes_.size();) {
+    std::size_t end = begin+1;
+    while (end+1 < nodes_.size() && nodes_[end] == nodes_[begin]) ++end;
+    if (end-begin >= 3 &&
+        canonical_same_station_supported(instance_,nodes_[begin])) {
+      for (std::size_t q = begin+1; q+1 < end; ++q) {
+        if (equivalent_pair(q,nodes_[begin]))
+          insertion_score_representatives_[q] = insertion_score_representatives_[q-1];
+      }
+    }
+    begin = end;
   }
   if (support_swaps) {
     swap_range_base_ = 1;
@@ -979,13 +1271,13 @@ RouteCostSummary PhysicalRouteScorer::evaluate_replacement(
   }
   const auto incoming = evaluator_.edge_label(nodes_[index - 1], {}, customer_id);
   const auto outgoing = evaluator_.edge_label(customer_id, {}, nodes_[index + 1]);
-  std::array<const ChargingSequenceLabel*, 4> components;
+  std::array<ChargingSequenceView, 4> components;
   std::size_t count = 0;
-  if (prefixes_[index - 1].initialized) components[count++] = &prefixes_[index - 1];
-  components[count++] = &incoming;
-  components[count++] = &outgoing;
-  if (suffixes_[index + 1].initialized) components[count++] = &suffixes_[index + 1];
-  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+  if (prefixes_[index - 1].initialized) components[count++] = prefixes_[index - 1];
+  components[count++] = incoming;
+  components[count++] = outgoing;
+  if (suffixes_[index + 1].initialized) components[count++] = suffixes_[index + 1];
+  return evaluator_.evaluate(std::span<const ChargingSequenceView>{
       components.data(), count});
 }
 
@@ -1007,11 +1299,11 @@ RouteCostSummary PhysicalRouteScorer::evaluate_swap(
   const auto out_a = evaluator_.edge_label(nodes_[b], {}, nodes_[a + 1]);
   const auto in_b = evaluator_.edge_label(nodes_[b - 1], {}, nodes_[a]);
   const auto out_b = evaluator_.edge_label(nodes_[a], {}, nodes_[b + 1]);
-  std::array<const ChargingSequenceLabel*, 256> components;
+  std::array<ChargingSequenceView, 256> components;
   std::size_t count = 0;
-  const auto add = [&](const ChargingSequenceLabel& label) {
+  const auto add = [&](ChargingSequenceView label) {
     if (count == components.size()) throw std::length_error("physical Swap range bound");
-    if (label.initialized) components[count++] = &label;
+    if (label.initialized) components[count++] = label;
   };
   add(prefixes_[a - 1]); add(in_a); add(out_a);
   std::array<std::size_t, 128> right_nodes;
@@ -1025,7 +1317,7 @@ RouteCostSummary PhysicalRouteScorer::evaluate_swap(
   }
   while (right_count) add(swap_ranges_[right_nodes[--right_count]]);
   add(in_b); add(out_b); add(suffixes_[b + 1]);
-  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+  return evaluator_.evaluate(std::span<const ChargingSequenceView>{
       components.data(), count});
 }
 
@@ -1040,12 +1332,13 @@ RouteCostSummary PhysicalRouteScorer::evaluate_relocate(
   if (instance_.node(nodes_[a]).kind != NodeKind::Customer || swap_ranges_.empty()) {
     throw std::invalid_argument("physical Relocate needs a customer and range labels");
   }
-  if (q == a - 1 || q == a) return evaluator_.evaluate(prefixes_.back());
-  std::array<const ChargingSequenceLabel*, 256> components;
+  if (q == a - 1 || q == a) return evaluator_.evaluate(std::span<const ChargingSequenceView>{
+      &prefixes_.back(), 1});
+  std::array<ChargingSequenceView, 256> components;
   std::size_t count = 0;
-  const auto add = [&](const ChargingSequenceLabel& label) {
+  const auto add = [&](ChargingSequenceView label) {
     if (count == components.size()) throw std::length_error("physical Relocate range bound");
-    if (label.initialized) components[count++] = &label;
+    if (label.initialized) components[count++] = label;
   };
   const auto range = [&](std::size_t begin, std::size_t end) {
     std::array<std::size_t, 128> right_nodes;
@@ -1068,8 +1361,13 @@ RouteCostSummary PhysicalRouteScorer::evaluate_relocate(
     add(prefixes_[a - 1]); add(removal); range(a + 1, q);
     add(incoming); add(outgoing); add(suffixes_[q + 1]);
   }
-  return evaluator_.evaluate(std::span<const ChargingSequenceLabel* const>{
+  return evaluator_.evaluate(std::span<const ChargingSequenceView>{
       components.data(), count});
+}
+
+std::size_t PhysicalRouteScorer::insertion_score_representative(
+    std::size_t physical_slot) const {
+  return insertion_score_representatives_.at(physical_slot);
 }
 
 RouteCostSummary PhysicalRouteScorer::evaluate_insertion(
@@ -1085,18 +1383,18 @@ RouteCostSummary PhysicalRouteScorer::evaluate_insertion(
       evaluator_.edge_label(nodes_[physical_slot], {}, customer_id);
   const auto outgoing =
       evaluator_.edge_label(customer_id, {}, nodes_[physical_slot + 1]);
-  std::array<const ChargingSequenceLabel*, 4> components;
+  std::array<ChargingSequenceView, 4> components;
   std::size_t count = 0;
   if (prefixes_[physical_slot].initialized) {
-    components[count++] = &prefixes_[physical_slot];
+    components[count++] = prefixes_[physical_slot];
   }
-  components[count++] = &incoming;
-  components[count++] = &outgoing;
+  components[count++] = incoming;
+  components[count++] = outgoing;
   if (suffixes_[physical_slot + 1].initialized) {
-    components[count++] = &suffixes_[physical_slot + 1];
+    components[count++] = suffixes_[physical_slot + 1];
   }
   return evaluator_.evaluate(
-      std::span<const ChargingSequenceLabel* const>{components.data(), count});
+      std::span<const ChargingSequenceView>{components.data(), count});
 }
 
 RouteCostSummary PhysicalRouteScorer::evaluate_removal(
@@ -1114,17 +1412,17 @@ RouteCostSummary PhysicalRouteScorer::evaluate_removal(
   }
   const auto shortcut = evaluator_.edge_label(
       nodes_[node_index - 1], {}, nodes_[node_index + 1]);
-  std::array<const ChargingSequenceLabel*, 3> components;
+  std::array<ChargingSequenceView, 3> components;
   std::size_t count = 0;
   if (prefixes_[node_index - 1].initialized) {
-    components[count++] = &prefixes_[node_index - 1];
+    components[count++] = prefixes_[node_index - 1];
   }
-  components[count++] = &shortcut;
+  components[count++] = shortcut;
   if (suffixes_[node_index + 1].initialized) {
-    components[count++] = &suffixes_[node_index + 1];
+    components[count++] = suffixes_[node_index + 1];
   }
   return evaluator_.evaluate(
-      std::span<const ChargingSequenceLabel* const>{components.data(), count});
+      std::span<const ChargingSequenceView>{components.data(), count});
 }
 
 struct RouteSequenceScorer::Implementation {

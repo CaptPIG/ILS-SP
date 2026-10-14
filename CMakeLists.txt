@@ -34,7 +34,7 @@ target_include_directories(ils_sp SYSTEM PUBLIC
 target_compile_definitions(ils_sp PUBLIC
   ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD=1
   ILS_SP_FORWARD_ONLY_TWO_OPT=1
-  ILS_SP_TYPED_DELETE_ENTRY=1
+  ILS_SP_TYPED_DELETE_ENTRY=0
   ILS_SP_PACKED_DFS_MASK=1
 )
 target_link_libraries(ils_sp PUBLIC
@@ -47,13 +47,13 @@ target_link_libraries(ils-sp PRIVATE ILS_SP::ils_sp)
 add_executable(ils-sp-with-schedule src/main_with_schedule.cpp)
 target_link_libraries(ils-sp-with-schedule PRIVATE ILS_SP::ils_sp)
 
-# The archived optimized recipe used GCC 14.2.0, -O3 -DNDEBUG -flto=2.
+# The frozen R4 recipe used GCC 14.2.0, -O3 -DNDEBUG -flto=1.
 # Keep LTO optional for other Linux toolchains and development builds.
 option(ILS_SP_ENABLE_LTO "Enable link-time optimization for optimized builds" OFF)
 if(ILS_SP_ENABLE_LTO)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(ils_sp PUBLIC -flto=2)
-    target_link_options(ils_sp PUBLIC -flto=2)
+    target_compile_options(ils_sp PUBLIC -flto=1)
+    target_link_options(ils_sp PUBLIC -flto=1)
   else()
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)

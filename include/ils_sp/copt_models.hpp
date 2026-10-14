@@ -10,6 +10,7 @@
 
 #include "ils_sp/evaluator.hpp"
 #include "ils_sp/pool.hpp"
+#include "ils_sp/detail/sp_dual_certificate.hpp"
 
 namespace ils_sp {
 
@@ -60,6 +61,7 @@ struct SetPartitioningSolveOptions {
   std::optional<double> maximum_wall_time_s;
   SetPartitioningProgressCallback progress;
   double progress_interval_s{30.0};
+  bool allow_lp_certificate{false};
 };
 
 struct FrvcpNetworkSize {
@@ -73,6 +75,18 @@ struct FrvcpNetworkSize {
   std::size_t active_station_copies{};
   std::size_t candidate_arcs{};
   std::size_t active_arcs{};
+};
+
+struct LinearRelaxationResult {
+  int status{};
+  std::string status_name;
+  std::optional<double> objective_h;
+  std::unordered_map<int, double> duals;
+  double runtime_s{};
+  double wall_runtime_s{};
+  std::optional<double> applied_time_limit_s;
+  CoptModelSize model_size;
+  double effective_abs_gap{};
 };
 
 struct SetPartitioningResult {
@@ -95,18 +109,14 @@ struct SetPartitioningResult {
   bool rounded_target_reached{};
   bool incumbent_stall_limit_reached{};
   CoptModelSize model_size;
+  bool lp_prepass_attempted{};
+  bool lp_prepass_exception{};
+  bool lp_certified_start{};
+  double lp_prepass_wall_s{};
+  detail::SpDualCertificate lp_certificate;
+  std::optional<LinearRelaxationResult> reused_relaxation;
 };
 
-struct LinearRelaxationResult {
-  int status{};
-  std::string status_name;
-  std::optional<double> objective_h;
-  std::unordered_map<int, double> duals;
-  double runtime_s{};
-  double wall_runtime_s{};
-  std::optional<double> applied_time_limit_s;
-  CoptModelSize model_size;
-};
 
 class CoptSetPartitioning {
  public:
@@ -118,7 +128,8 @@ class CoptSetPartitioning {
       SetPartitioningSolveOptions options = {});
   [[nodiscard]] LinearRelaxationResult solve_relaxation(
       const std::vector<RouteColumn>& columns,
-      CoptDeadline deadline = std::nullopt);
+      CoptDeadline deadline = std::nullopt,
+      bool read_certificate_abs_gap = false);
 
  private:
   [[nodiscard]] std::vector<std::vector<std::size_t>> customer_incidence(

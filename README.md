@@ -4,22 +4,20 @@ A research-oriented C++20 implementation of iterated local search with set
 partitioning (ILS-SP) for the electric vehicle routing problem with nonlinear
 charging functions (E-VRP-NL).
 
-The solver specializes the broader HEVRP-NL method of Wang et al. (2025) to the
-Montoya et al. (2017) benchmark: one vehicle type, no customer demand, no
-customer time windows, no charging-station waiting functions, and an objective
-equal to driving time plus charging time.
+## Frozen R4 mainline
 
-> **Implementation status**
->
-> This is an independent research prototype, not the authors' reference code.
-> The current mainline is the frozen `439f_plus_exact_packed_DFS_mask` source:
-> the 439f policy plus an exact packed-station DFS remaining-mask optimization.
-> It does not consistently reproduce the solution quality and runtime reported
-> in the TRC paper. Results must be identified as results of this implementation.
-> The packed DFS change preserves ascending station enumeration and does not
-> alter its floating-point arithmetic, pruning, dominance, descriptor order,
-> or RNG usage. Focused equivalence checks are not a complete performance or
-> paper-reproduction guarantee.
+The current mainline publishes the frozen R4 source variant
+`n40_dual_start_and_rc_ub0_v2`. The 27 core and command-line source files are
+byte-preserved from the frozen input; only repository paths and build metadata
+are adapted. This is an independent research prototype, not the authors'
+reference implementation or a claim of reproducing the paper's results.
+
+R4 integrates reduced-cost fixing for the N > 10 paper-profile unlimited-SP
+entry using the existing full LP. The full route pool and original LP feedback
+remain intact; fixing changes only the current MIP upper bounds. N <= 10 skips
+this prepass. The frozen configuration disables typed entry deletion and retains
+physical reverse-empty-child handling, forward-only two-opt, and packed DFS masks.
+No later two-opt profile-reuse experiment is included.
 
 ## Algorithm provenance
 
@@ -41,44 +39,38 @@ table below records the primary source used for each implemented component.
 The current mainline uses COPT 8.0.7 instead of the CPLEX configuration
 reported by Wang et al. (2025). Earlier Gurobi files are retained for historical
 context but are not part of the current build. Details not uniquely specified
-by the papers remain implementation choices. In particular, the retained typed
-entry deletion and deficit-gap weighting policies are disclosed assumptions,
-not established author behavior. The `paper` profile is the closest implemented
+by the papers remain implementation choices. In particular, the retained deficit-gap weighting policy is a disclosed assumption,
+not established author behavior. R4 disables typed entry deletion. The `paper` profile is the closest implemented
 interpretation; it does not, by itself, select every option in the frozen
 mainline run recipe below.
 
+
 ## Repository layout
 
-```text
-include/ils_sp/          public headers for the COPT mainline
-src/                    byte-preserved core and command-line source
-src/main_with_schedule.cpp  frontend with output-only retained-schedule export
-SOURCE_PROVENANCE.json   frozen archive identity and per-source SHA-256 map
-build_mainline.sh       archived GCC-compatible build recipe, adapted paths
-```
+- `include/ils_sp/`: frozen public headers
+- `src/`: frozen core and command-line source, alongside retained legacy files
+- `src/main_with_schedule.cpp`: frontend with retained-schedule output
+- `SOURCE_PROVENANCE.json`: frozen identity and per-source SHA-256 map
+- `build_mainline.sh`: frozen GCC-compatible build flags with repository paths
 
-Existing Gurobi source, test files, benchmark data, license, and citations remain
-in the repository. The current build excludes the legacy Gurobi files and test
-targets. This update does not claim that the historical test suite validates
-the new mainline. Experiment runners, result logs, binaries, commercial SDKs,
-licenses, and credentials are not included.
+Existing Gurobi source, test files, benchmark data, license, and citations are
+retained. The current build excludes legacy Gurobi files and test targets.
+This publication adds no test artifacts, experiment runners, result logs,
+binaries, commercial SDKs, license keys, or local recovery manifests.
 
 ## Prerequisites
 
-- Linux: the frozen source uses Linux filesystem APIs
-- C++20 compiler; the frozen recipe used GCC 14.2.0
+- Linux and a C++20 compiler; the frozen build used GNU C++ 14.2.0
 - COPT 8.0.7 C++ SDK and your own separately authorized license
-- xxHash 0.8.3 runtime (`libxxhash.so.0`)
+- xxHash runtime (`libxxhash.so.0`)
 - CMake 3.24 or newer for the optional CMake build
 
-Set `COPT_HOME` to the SDK directory containing `include/` and `lib/`.
-The COPT SDK and license must be installed and configured separately; neither
-is supplied by this repository. No setup command here downloads dependencies.
+Install dependencies separately and set `COPT_HOME` to the SDK directory
+containing `include/` and `lib/`. No command below downloads dependencies.
 
 ## Build
 
-The direct build follows the frozen recipe (`-O3 -DNDEBUG -flto=2`) and creates
-both frontends:
+The direct recipe uses `-O3 -DNDEBUG -flto=1` and builds both frontends:
 
 ```bash
 export COPT_HOME=/path/to/copt80
@@ -87,31 +79,29 @@ build/mainline/ils-sp --help
 build/mainline/ils-sp-with-schedule --help
 ```
 
-`CXX` and `BUILD_DIR` can override the compiler and build directory.
-All translation units use these four definitions:
+`CXX` and `BUILD_DIR` may override the compiler and output directory.
+All translation units use the frozen R4 definitions:
 
 ```text
 ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD=1
 ILS_SP_FORWARD_ONLY_TWO_OPT=1
-ILS_SP_TYPED_DELETE_ENTRY=1
+ILS_SP_TYPED_DELETE_ENTRY=0
 ILS_SP_PACKED_DFS_MASK=1
 ```
 
-Optional CMake builds use the same source files and definitions:
+The existing CMake release preset uses the same source and definitions:
 
 ```bash
 cmake --preset release -DCOPT_HOME="$COPT_HOME"
 cmake --build --preset release --parallel 1
-# Development build without LTO:
-cmake --preset dev -DCOPT_HOME="$COPT_HOME"
-cmake --build --preset dev --parallel 1
 ```
 
-The CMake executables are under `build/release-make/` or `build/dev-make/`.
-CMake does not run the legacy tests. A rebuilt executable has its own identity;
-it must not be labeled with the historical binary SHA in the provenance file.
+Executables are written under `build/release-make/`. The `dev` preset disables
+LTO and enables a Debug build; it is not the frozen optimized recipe.
+Build metadata was adapted for this publication; no new build or tests were
+run as part of the upload. A rebuilt executable has its own identity.
 
-## Quick start
+## Usage
 
 ```bash
 build/mainline/ils-sp \
@@ -119,66 +109,33 @@ build/mainline/ils-sp \
   --search-profile paper --iterations 100 --seed 84001 --threads 1
 ```
 
-This is a short CLI example. Use the complete recipe below when comparing the
-frozen mainline. `ils-sp --help` lists the full interface; some available options
-represent earlier experiments rather than the selected mainline configuration.
+This is a short CLI example, not a benchmark recipe. Use `--help` to inspect
+the complete interface and set all relevant options for your experiment.
 
-## Frozen mainline run recipe
+To export the retained physical schedule, set
+`ILS_SP_VALIDATION_JSON=/path/to/schedule.json` and run
+`ils-sp-with-schedule`. This output frontend does not re-optimize the solution.
+The output file is overwritten, so choose a fresh path for each run.
 
-Supply your benchmark XML file as `INSTANCE`. The documented N80 configuration
-uses 50,000 iterations, Gamma 32, seed 84001, a 5,000-route main pool, SP and
-backup intervals of 1,500, four SP-integer threads, and a 10-second solve-wide
-active FRVCP wall budget:
-
-```bash
-INSTANCE=/path/to/benchmark.xml
-export ILS_SP_CATALOG_RAM_BYTES=1073741824
-export ILS_SP_CATALOG_BLOCK_BYTES=67108864
-export ILS_SP_CATALOG_METADATA_BYTES=134217728
-export ILS_SP_CATALOG_DISK_BYTES=4294967296
-
-build/mainline/ils-sp-with-schedule \
-  --instance "$INSTANCE" --iterations 50000 --seed 84001 --progress 1500 \
-  --search-profile paper --promising-arcs 32 \
-  --sp-stall-limit 0 --sp-time-limit 0 \
-  --path-catalog complete --insertion-paths preserve-cs \
-  --pool-identity coverage --continuation record --replace-path-attempts 1 \
-  --partial-route-subset random --sp-frequency 1500 --backup-frequency 1500 \
-  --pool-capacity 5000 --adaptive-sp-stall 0 \
-  --route-opening-paths projected --initialization-paths physical \
-  --preserve-swap-stations --sp-threads 4 --frvcp-wall-budget 10
-```
-
-The archived witness was additionally bounded externally to 600 CPU seconds,
-720 wall seconds, and 4 GiB address space. Those process limits are not set by
-the command above. The full N80 benchmark files are not added by this update.
-
-To export the winning retained physical schedule, set
-`ILS_SP_VALIDATION_JSON=/path/to/schedule.json` before using
-`ils-sp-with-schedule`. This output-only frontend does not re-optimize the
-solution. The output file is overwritten, so choose a new path for each run.
-
-The optional disk tier is enabled only when `ILS_SP_CATALOG_DISK_DIR` is set to
-an absolute, fresh directory path. The frozen implementation requires its
+The optional disk tier is enabled only when `ILS_SP_CATALOG_DISK_DIR` is set
+to an absolute fresh directory path. The frozen implementation requires its
 existing parent to be below `/workspace/`, rejects tmpfs/ramfs, and checks for
 4,096-byte filesystem blocks and sufficient space. Unusable backing paths
-fall back to the in-memory tier. Existing cache directories are never reused
-or overwritten. Leave this variable unset for an in-memory run; merely setting
-the disk-byte budget does not enable disk storage. This environment-specific
-restriction is retained to preserve source exactness.
+fall back to the in-memory tier. Leave the variable unset for an in-memory run.
+This environment-specific restriction is preserved in the original source.
 
 ## Source identity
 
-`SOURCE_PROVENANCE.json` maps every uploaded mainline source file to its path
-and SHA-256 inside the frozen archive. Core and frontend bytes are unchanged;
-only their repository paths and build metadata are adapted. The archive's
-SHA-256 is:
+The frozen 44-file input identity has SHA-256:
 
 ```text
-af49f1efffbebdf444e360253a2ee37911cbfe6cd34218a03ee56f2727243830
+a43f547aebfc8841eef83b69fb3d5e4a7842867b9347f4ea5f5d689a23272633
 ```
 
-The mainline excludes the first-escape experiment and radix-sort changes.
+`SOURCE_PROVENANCE.json` identifies the 27 published core/frontend source files,
+their relative frozen-input paths, and byte-level hashes. The remaining frozen
+input files are recovery metadata, tests, and patches that are not published.
+The source identity is not an archive hash or an executable hash.
 
 ## Benchmark data
 

@@ -1,4 +1,6 @@
 #include "ils_sp/search.hpp"
+#include "route_opening_rp_reserve.hpp"
+#include "bounded_rp_proxy.hpp"
 
 #ifndef ILS_SP_PACKED_DFS_MASK
 #define ILS_SP_PACKED_DFS_MASK 0
@@ -7,6 +9,9 @@
 #ifndef ILS_SP_TYPED_DELETE_ENTRY
 #define ILS_SP_TYPED_DELETE_ENTRY 0
 #endif
+
+static_assert(ILS_SP_TYPED_DELETE_ENTRY == 0,
+              "Uniform RP candidate requires ILS_SP_TYPED_DELETE_ENTRY=0");
 
 #ifndef ILS_SP_FORWARD_ONLY_TWO_OPT
 #define ILS_SP_FORWARD_ONLY_TWO_OPT 0
@@ -29,6 +34,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <queue>
 #include <set>
@@ -65,8 +71,10 @@ class PhysicalReverseTwoOptProfile {
   PhysicalReverseTwoOptProfile(const Instance& instance, const Plan& plan,
                               const NonlinearSequenceEvaluator& evaluator)
       : visits_(plan.route.visits), cuts_{0},
-        prefix_(visits_.size() + 1), reverse_prefix_(visits_.size() + 1),
-        suffix_(visits_.size() + 1), reverse_suffix_(visits_.size() + 1) {
+        prefix_(visits_.size() + 1),
+        reverse_prefix_(ILS_SP_FORWARD_ONLY_TWO_OPT ? 0 : visits_.size() + 1),
+        suffix_(visits_.size() + 1),
+        reverse_suffix_(ILS_SP_FORWARD_ONLY_TWO_OPT ? 0 : visits_.size() + 1) {
     for (std::size_t p = 0; p < visits_.size(); ++p) {
       if (instance.node(visits_[p]).kind == NodeKind::Customer) cuts_.push_back(p + 1);
     }
@@ -79,17 +87,21 @@ class PhysicalReverseTwoOptProfile {
     for (std::size_t end = 2; end <= visits_.size(); ++end) {
       prefix_[end] = evaluator.concatenate(prefix_[end - 1],
           evaluator.edge_label(visits_[end - 2], {}, visits_[end - 1]));
+#if !ILS_SP_FORWARD_ONLY_TWO_OPT
       reverse_prefix_[end] = evaluator.concatenate(
           evaluator.edge_label(visits_[end - 1], {}, visits_[end - 2]),
           reverse_prefix_[end - 1]);
+#endif
     }
     for (std::size_t begin = visits_.size(); begin-- > 0;) {
       if (begin + 1 == visits_.size()) continue;
       suffix_[begin] = evaluator.concatenate(
           evaluator.edge_label(visits_[begin], {}, visits_[begin + 1]),
           suffix_[begin + 1]);
+#if !ILS_SP_FORWARD_ONLY_TWO_OPT
       reverse_suffix_[begin] = evaluator.concatenate(reverse_suffix_[begin + 1],
           evaluator.edge_label(visits_[begin + 1], {}, visits_[begin]));
+#endif
     }
   }
 
@@ -1726,6 +1738,7 @@ std::size_t PathSampler::PathCatalog::size() const noexcept {
 }
 
 #include "catalog_disk_cache.inc"
+#include "bounded_rp_proxy.inc"
 
 PathSampler::PathSampler(const Instance& instance, PlanFactory& factory,
                          std::mt19937_64& random, bool complete_paths,
@@ -1765,17 +1778,51 @@ void PathSampler::build_curve_order() {
       }
     }
   }
+  // Pairwise epsilon equivalence is not transitive and cannot be used by
+  // std::sort. Compare exact finite signatures on one common energy grid.
+  // Tolerance remains only in the separate dominance validation below.
+  std::vector<double> energy_breakpoints;
+  for (const auto& type : curve_types) {
+    for (const ChargingPoint& point : instance_.charging_curves().at(type).points()) {
+      energy_breakpoints.push_back(point.energy_wh);
+    }
+  }
+  std::sort(energy_breakpoints.begin(), energy_breakpoints.end());
+  energy_breakpoints.erase(
+      std::unique(energy_breakpoints.begin(), energy_breakpoints.end()),
+      energy_breakpoints.end());
+  std::map<std::string, std::vector<double>> curve_signatures;
+  for (const auto& type : curve_types) {
+    const ChargingCurve& curve = instance_.charging_curves().at(type);
+    auto& signature = curve_signatures[type];
+    for (std::size_t index = 1; index < energy_breakpoints.size(); ++index) {
+      const double duration = curve.charge_duration(
+          energy_breakpoints[index - 1], energy_breakpoints[index]);
+      if (!std::isfinite(duration)) {
+        throw std::invalid_argument("charging curve ordering requires finite durations");
+      }
+      signature.push_back(duration);
+    }
+  }
   std::sort(curve_types.begin(), curve_types.end(),
             [&](const std::string& left, const std::string& right) {
-              const bool left_no_slower = charging_curve_no_slower(
-                  instance_.charging_curves().at(left),
-                  instance_.charging_curves().at(right));
-              const bool right_no_slower = charging_curve_no_slower(
-                  instance_.charging_curves().at(right),
-                  instance_.charging_curves().at(left));
-              if (left_no_slower != right_no_slower) return left_no_slower;
+              const auto& first = curve_signatures.at(left);
+              const auto& second = curve_signatures.at(right);
+              if (first != second) return first < second;
               return left < right;
             });
+  // A rank is consumed as a total dominance chain. Validate every pair:
+  // adjacent epsilon comparisons alone would not establish transitivity.
+  for (std::size_t left = 0; left < curve_types.size(); ++left) {
+    for (std::size_t right = left + 1; right < curve_types.size(); ++right) {
+      if (!charging_curve_no_slower(
+              instance_.charging_curves().at(curve_types[left]),
+              instance_.charging_curves().at(curve_types[right]))) {
+        throw std::invalid_argument(
+            "paper path dominance requires a consistent charging curve order");
+      }
+    }
+  }
   for (std::size_t rank = 0; rank < curve_types.size(); ++rank) {
     curve_rank_by_type_.emplace(curve_types[rank], rank);
   }
@@ -3785,9 +3832,9 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
   }
   Solution current{{std::move(first_plan)}};
   if (preserve_station_visits_) {
-    // A singleton is completed only when its optimistic cost can still beat
-    // an existing placement. All candidates retain the same greedy total order;
-    // completions are local to this fixed-lambda build and consume no RNG.
+    // Random first customer is unchanged. The one shuffle is the deterministic
+    // base continuation and tie order for initialization-only fortified rollout.
+    std::shuffle(unassigned.begin(), unassigned.end(), random_);
     std::unordered_map<int, Plan> singletons;
     std::unordered_map<int, double> singleton_bounds;
     NonlinearSequenceEvaluator direct_scorer(instance_);
@@ -3796,36 +3843,64 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
           direct_scorer.evaluate(direct_scorer.route_label(Route{{customer}})),
           instance_, penalty_lambda, &path_sampler_));
     }
-    std::vector<std::unique_ptr<PhysicalRouteScorer>> scorers;
-    scorers.push_back(std::make_unique<PhysicalRouteScorer>(instance_, current.plans[0]));
-    ++statistics_.physical_route_profiles_built;
-    while (!unassigned.empty()) {
+    // Fixed instance/lambda/direct-rebuild policy throughout this construction.
+    // Detached trials share deterministic completion results, never RNG draws.
+    std::unordered_map<std::vector<int>, Plan, IntVectorHash> rebuilt_sequences;
+    const auto insert_best = [&](const Solution& source, int customer) {
       ++statistics_.physical_insertion_decisions;
       std::optional<InsertionMove> best;
-      for (const int customer : unassigned) {
-        for (std::size_t route = 0; route < current.plans.size(); ++route) {
-          const double old_cost = generalized_cost(
-              *current.plans[route].evaluation, instance_, penalty_lambda);
-          const std::size_t slots = current.plans[route].route.visits.size() + 1;
-          for (std::size_t slot = 0; slot < slots; ++slot) {
-            const double cost = generalized_cost(
-                scorers[route]->evaluate_insertion(slot, customer), instance_, penalty_lambda);
-            InsertionMove move;
-            move.customer_id = customer;
-            move.route_index = route;
-            move.position = slot;
-            move.delta = cost - old_cost;
-            ++statistics_.physical_insertion_candidates;
-            if (!best || insertion_better(move, *best)) best = std::move(move);
+      std::optional<Plan> best_plan;
+      bool best_non_retained = true;
+      // Exact-cost ties preserve existing charging structure across placements.
+      // This lexicographic key changes no strict generalized-cost comparison.
+      const auto consider = [&](InsertionMove move, const Plan& plan,
+                                bool non_retained) {
+        const auto rank = std::tuple{move.delta, non_retained, move.customer_id,
+                                     move.route_index, move.position};
+        if (!best || rank < std::tuple{best->delta, best_non_retained,
+                                      best->customer_id, best->route_index,
+                                      best->position}) {
+          best = std::move(move);
+          best_plan = plan;
+          best_non_retained = non_retained;
+        }
+      };
+      for (std::size_t route = 0; route < source.plans.size(); ++route) {
+        const double old_cost = generalized_cost(
+            *source.plans[route].evaluation, instance_, penalty_lambda);
+        const std::size_t slots = source.plans[route].route.visits.size() + 1;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          auto visits = source.plans[route].route.visits;
+          visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(slot), customer);
+          Plan retained = factory_.plan_visits(std::move(visits));
+          const double retained_cost = generalized_cost(
+              *retained.evaluation, instance_, penalty_lambda);
+          auto completed = rebuilt_sequences.find(retained.customer_ids);
+          if (completed == rebuilt_sequences.end()) {
+            ++statistics_.completion_memo_misses;
+            ++statistics_.candidates_evaluated;
+            Plan rebuilt = path_sampler_.repair_new_gaps(
+                factory_.plan_sequence(retained.customer_ids), {}, penalty_lambda);
+            completed = rebuilt_sequences.emplace(
+                retained.customer_ids, std::move(rebuilt)).first;
+          } else {
+            ++statistics_.completion_memo_hits;
           }
+          const double rebuilt_cost = generalized_cost(
+              *completed->second.evaluation, instance_, penalty_lambda);
+          const bool use_rebuilt = rebuilt_cost < retained_cost;
+          const Plan& selected = use_rebuilt ? completed->second : retained;
+          InsertionMove move;
+          move.customer_id = customer;
+          move.route_index = route;
+          move.position = slot;
+          move.delta = (use_rebuilt ? rebuilt_cost : retained_cost) - old_cost;
+          ++statistics_.physical_insertion_candidates;
+          consider(std::move(move), selected, use_rebuilt);
         }
       }
-      for (const int customer : unassigned) {
-        // The certified travel/horizon relaxation permits two station paths
-        // and ignores energy penalties. Keep the
-        // existing numeric safety margin and evaluate every possible tie.
-        ++statistics_.physical_insertion_candidates;
-        if (singleton_bounds.at(customer) > best->delta + kLinkedBoundSafety) continue;
+      ++statistics_.physical_insertion_candidates;
+      if (singleton_bounds.at(customer) <= best->delta + kLinkedBoundSafety) {
         auto cached = singletons.find(customer);
         if (cached == singletons.end()) {
           cached = singletons.emplace(customer, path_sampler_.repair_new_gaps(
@@ -3833,30 +3908,123 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
         }
         InsertionMove move;
         move.customer_id = customer;
-        move.route_index = current.plans.size();
+        move.route_index = source.plans.size();
         move.position = 0;
         move.delta = generalized_cost(*cached->second.evaluation, instance_, penalty_lambda);
         if (singleton_bounds.at(customer) > move.delta + kLinkedBoundSafety) {
           throw std::logic_error("singleton lower bound exceeded completed cost");
         }
-        if (insertion_better(move, *best)) best = std::move(move);
+        // A completed singleton has no incumbent physical structure to retain.
+        consider(std::move(move), cached->second, true);
       }
-      const std::size_t route = best->route_index;
-      const int customer = best->customer_id;
-      if (route == current.plans.size()) {
-        current.plans.push_back(singletons.at(customer));
+      if (!best_plan) throw std::logic_error("missing retained/rebuilt rollout winner");
+      Solution result = source;
+      if (best->route_index == result.plans.size()) {
+        result.plans.push_back(std::move(*best_plan));
       } else {
-        auto visits = current.plans[route].route.visits;
-        visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(best->position), customer);
-        current.plans[route] = factory_.plan_visits(std::move(visits));
+        result.plans[best->route_index] = std::move(*best_plan);
       }
-      std::erase(unassigned, customer);
-      if (!unassigned.empty()) {
-        auto updated = std::make_unique<PhysicalRouteScorer>(instance_, current.plans[route]);
-        if (route == scorers.size()) scorers.push_back(std::move(updated));
-        else scorers[route] = std::move(updated);
-        ++statistics_.physical_route_profiles_built;
+      return result;
+    };
+    struct ConstructionAction {
+      int customer{};
+      Solution before;
+      Solution after;
+    };
+    struct ConstructionContinuation {
+      std::vector<ConstructionAction> actions;
+      double cost{};
+    };
+    const auto complete = [&](Solution state, const std::vector<int>& order) {
+      ConstructionContinuation result;
+      result.actions.reserve(order.size());
+      for (const int customer : order) {
+        Solution after = insert_best(state, customer);
+        result.actions.push_back({customer, state, after});
+        state = std::move(after);
       }
+      state.validate_partition(instance_);
+      result.cost = generalized_cost(state, instance_, penalty_lambda);
+      return result;
+    };
+    const auto same_physical_state = [](const Solution& left, const Solution& right) {
+      if (left.plans.size() != right.plans.size()) return false;
+      for (std::size_t i = 0; i < left.plans.size(); ++i) {
+        if (left.plans[i].route.visits != right.plans[i].route.visits) return false;
+      }
+      return true;
+    };
+    // Default policy: finite full breadth, with no new time or restart budget.
+    // Only a fully returned continuation can replace the saved base fallback.
+    // Preserve the complete actual one-action rollout as the deeper policy's
+    // incumbent, rather than only its less informed shuffled base completion.
+    const auto fortify = [&](Solution state, std::vector<int> remaining,
+                             ConstructionContinuation incumbent,
+                             bool use_root_pair) {
+      std::vector<ConstructionAction> committed;
+      committed.reserve(remaining.size());
+      bool first_decision = use_root_pair;
+      while (!remaining.empty()) {
+        const auto consider_order = [&](const std::vector<int>& order) {
+          bool same_order = order.size() == incumbent.actions.size();
+          for (std::size_t i = 0; same_order && i < order.size(); ++i) {
+            same_order = order[i] == incumbent.actions[i].customer;
+          }
+          if (same_order) return;
+          ConstructionContinuation challenger = complete(state, order);
+          if (challenger.cost < incumbent.cost - kCostTolerance) {
+            incumbent = std::move(challenger);
+          }
+        };
+        for (const int customer : remaining) {
+          if (first_decision && remaining.size() > 1) {
+            // Only the first post-random decision looks ahead two customer choices.
+            // Every trial still uses true cheapest placement and the same base suffix.
+            for (const int second : remaining) {
+              if (second == customer) continue;
+              std::vector<int> order{customer, second};
+              order.reserve(remaining.size());
+              for (const int other : remaining) {
+                if (other != customer && other != second) order.push_back(other);
+              }
+              consider_order(order);
+            }
+          } else {
+            std::vector<int> order{customer};
+            order.reserve(remaining.size());
+            for (const int other : remaining) if (other != customer) order.push_back(other);
+            consider_order(order);
+          }
+        }
+        first_decision = false;
+        if (incumbent.actions.empty() ||
+            !same_physical_state(state, incumbent.actions.front().before)) {
+          throw std::logic_error("rollout continuation lost its committed prefix");
+        }
+        const int customer = incumbent.actions.front().customer;
+        ConstructionAction action = std::move(incumbent.actions.front());
+        state = action.after;
+        committed.push_back(std::move(action));
+        incumbent.actions.erase(incumbent.actions.begin());
+        std::erase(remaining, customer);
+      }
+      state.validate_partition(instance_);
+      if (std::abs(generalized_cost(state, instance_, penalty_lambda) -
+                   incumbent.cost) > kCostTolerance) {
+        throw std::logic_error("fortified constructor saved cost mismatch");
+      }
+      return ConstructionContinuation{std::move(committed), incumbent.cost};
+    };
+    ConstructionContinuation one_action = fortify(
+        current, unassigned, complete(current, unassigned), false);
+    const double baseline_cost = one_action.cost;
+    ConstructionContinuation selected = fortify(
+        current, unassigned, std::move(one_action), true);
+    if (selected.cost > baseline_cost + kCostTolerance) {
+      throw std::logic_error("deeper construction worsened one-action baseline");
+    }
+    if (!selected.actions.empty()) {
+      current = std::move(selected.actions.back().after);
     }
     current.validate_partition(instance_);
     return current;
@@ -3960,6 +4128,139 @@ Solution InitialSolutionBuilder::build(double penalty_lambda) {
   return current;
 }
 
+// One current-state epoch; stores insertion decisions, never output Plans or
+// owning evaluation handles. All actual winner materialization is replayed.
+struct Perturbation::RepairDecisionMemo {
+  struct Step { int customer{}; std::size_t route{}, slot{}; };
+  struct Certificate {
+    std::weak_ptr<const RouteEvaluation> value;
+    bool exact{};
+    bool matches(const Plan& p) const {
+      const auto locked = value.lock();
+      return locked && locked == p.evaluation && exact == p.exact_charging;
+    }
+  };
+  struct AnchorPlan {
+    std::vector<int> customers, visits;
+    std::vector<std::vector<int>> gaps;
+    Certificate certificate;
+    bool matches(const Plan& p) const {
+      return certificate.matches(p) && customers == p.customer_ids &&
+          visits == p.route.visits && gaps == p.gaps;
+    }
+  };
+  struct Entry {
+    std::vector<int> removed;
+    RepairOperator operation{};
+    std::vector<Certificate> certificates;
+    std::vector<Step> steps;
+    std::uint64_t candidates{}, profiles{};
+    std::size_t bytes() const {
+      return sizeof(Entry) + removed.capacity()*sizeof(int) +
+          certificates.capacity()*(sizeof(Certificate)+sizeof(RouteEvaluation)+64) +
+          steps.capacity()*sizeof(Step);
+    }
+  };
+  static constexpr std::size_t capacity = 16, byte_limit = 128*1024;
+  std::vector<AnchorPlan> anchor;
+  std::vector<Entry> entries;
+  std::uint64_t lambda_bits{};
+  std::size_t anchor_bytes{};
+  bool active{};
+  RepairDecisionMemo() { entries.reserve(capacity); }
+  void reset() { anchor.clear();entries.clear();anchor_bytes=0;active=false; }
+  void begin(const Solution& s, double lambda, InsertionCandidateStatistics& stats) {
+    const auto bits=std::bit_cast<std::uint64_t>(lambda);
+    if (!std::isfinite(lambda) || lambda<0 || !supported_bound_fp_environment()) {
+      reset();return;
+    }
+    bool same=active && lambda_bits==bits && anchor.size()==s.plans.size();
+    for(std::size_t i=0;same && i<anchor.size();++i) same=anchor[i].matches(s.plans[i]);
+    if(same)return;
+    reset();++stats.repair_memo_epoch_changes;lambda_bits=bits;
+    // Upper-bound the source vector payload before copying an oversized state.
+    std::size_t estimate=sizeof(*this)+capacity*sizeof(Entry);
+    for(const auto& p:s.plans) {
+      estimate+=sizeof(AnchorPlan)+sizeof(RouteEvaluation)+64+
+          (p.customer_ids.size()+p.route.visits.size())*sizeof(int)+
+          p.gaps.size()*sizeof(std::vector<int>);
+      for(const auto& g:p.gaps)estimate+=g.size()*sizeof(int);
+      if(estimate>byte_limit){++stats.repair_memo_byte_bypasses;return;}
+    }
+    for(const auto& p:s.plans) anchor.push_back({p.customer_ids,p.route.visits,p.gaps,{p.evaluation,p.exact_charging}});
+    anchor_bytes=sizeof(*this)+capacity*sizeof(Entry)+anchor.capacity()*sizeof(AnchorPlan);
+    for(const auto& p:anchor) {
+      anchor_bytes+=sizeof(RouteEvaluation)+64+(p.customers.capacity()+p.visits.capacity())*sizeof(int)+p.gaps.capacity()*sizeof(std::vector<int>);
+      for(const auto& g:p.gaps)anchor_bytes+=g.capacity()*sizeof(int);
+    }
+    if(anchor_bytes>byte_limit){reset();++stats.repair_memo_byte_bypasses;return;}
+    active=true;
+  }
+  static bool valid_tape(const Entry& e,const DestroyedSolution& d) {
+    if(e.steps.size()!=d.removed_customers.size())return false;
+    std::vector<std::size_t> lengths,shells;
+    for(const auto& p:d.remaining.plans)lengths.push_back(p.route.visits.size());
+    for(const auto& s:d.station_shells)shells.push_back(s.size());
+    auto pending=d.removed_customers;
+    for(const auto& step:e.steps) {
+      if(std::find(pending.begin(),pending.end(),step.customer)==pending.end())return false;
+      const auto required=std::count_if(shells.begin(),shells.end(),[](auto n){return n!=0;});
+      const bool must_activate=pending.size()==static_cast<std::size_t>(required);
+      if(step.route<lengths.size()) {
+        if(must_activate || step.slot>lengths[step.route])return false;
+        ++lengths[step.route];
+      } else {
+        const auto shell=step.route-lengths.size();
+        if(shell<shells.size()) {
+          if(shells[shell]==0 || step.slot>shells[shell])return false;
+          lengths.push_back(shells[shell]+1);shells[shell]=0;
+        } else {
+          if(shell!=shells.size() || must_activate || step.slot!=0)return false;
+          lengths.push_back(1);
+        }
+      }
+      std::erase(pending,step.customer);
+    }
+    return pending.empty() && std::none_of(shells.begin(),shells.end(),[](auto n){return n!=0;});
+  }
+  std::optional<Entry> find(const DestroyedSolution& d,RepairOperator op,InsertionCandidateStatistics& stats) {
+    if(!active)return std::nullopt;
+    for(std::size_t j=0;j<entries.size();++j) {
+      const auto& e=entries[j];
+      if(e.operation!=op || e.removed!=d.removed_customers)continue;
+      bool same=e.certificates.size()==d.remaining.plans.size();
+      for(std::size_t i=0;same && i<e.certificates.size();++i)same=e.certificates[i].matches(d.remaining.plans[i]);
+      if(!same || !valid_tape(e,d)) {
+        entries.erase(entries.begin()+static_cast<std::ptrdiff_t>(j));
+        ++stats.repair_memo_invalid_entries;break;
+      }
+      Entry result=e;
+      std::rotate(entries.begin(),entries.begin()+static_cast<std::ptrdiff_t>(j),entries.begin()+static_cast<std::ptrdiff_t>(j+1));
+      ++stats.repair_memo_hits;
+      stats.repair_memo_candidates_saved+=result.candidates;
+      stats.repair_memo_profiles_saved+=result.profiles;
+      return result;
+    }
+    ++stats.repair_memo_misses;return std::nullopt;
+  }
+  Entry input(const DestroyedSolution& d,RepairOperator op) const {
+    Entry e;e.removed=d.removed_customers;e.operation=op;
+    for(const auto& p:d.remaining.plans)e.certificates.push_back({p.evaluation,p.exact_charging});
+    e.steps.reserve(e.removed.size());return e;
+  }
+  void put(Entry entry,InsertionCandidateStatistics& stats) {
+    if(!active)return;
+    if(anchor_bytes+entry.bytes()>byte_limit){++stats.repair_memo_byte_bypasses;return;}
+    std::size_t bytes=anchor_bytes+entry.bytes();for(const auto& e:entries)bytes+=e.bytes();
+    while(!entries.empty() && (entries.size()>=capacity || bytes>byte_limit)) {
+      bytes-=entries.back().bytes();entries.pop_back();++stats.repair_memo_evictions;
+    }
+    entries.insert(entries.begin(),std::move(entry));
+  }
+};
+
+Perturbation::~Perturbation() = default;
+
 Perturbation::Perturbation(const Instance& instance, PlanFactory& factory,
                            PathSampler& path_sampler,
                            std::mt19937_64& random,
@@ -3984,6 +4285,7 @@ Perturbation::Perturbation(const Instance& instance, PlanFactory& factory,
   if (preserve_station_visits_ && profile_ != SearchProfile::Paper) {
     throw std::invalid_argument("station-preserving LNS requires the paper VND profile");
   }
+  if (preserve_station_visits_) repair_decision_memo_ = std::make_unique<RepairDecisionMemo>();
 }
 
 DestroyedSolution Perturbation::destroy(const Solution& solution,
@@ -4149,29 +4451,7 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
   }
 
   if (preserve_station_visits_) {
-    const std::unordered_set<int> removed_set(removed.begin(), removed.end());
-    Solution remaining;
-    remaining.plans.reserve(solution.plans.size());
-    for (const Plan& plan : solution.plans) {
-      if (std::none_of(plan.customer_ids.begin(), plan.customer_ids.end(),
-                       [&](int id) { return removed_set.contains(id); })) {
-        remaining.plans.push_back(plan);
-        continue;
-      }
-      if (std::all_of(plan.customer_ids.begin(), plan.customer_ids.end(),
-                      [&](int id) { return removed_set.contains(id); })) {
-        continue;  // A route with no remaining customers is removed as a whole.
-      }
-      std::vector<int> visits;
-      visits.reserve(plan.route.visits.size());
-      for (const int id : plan.route.visits) {
-        if (!removed_set.contains(id)) visits.push_back(id);
-      }
-      // Keep every station occurrence, including those now sharing a gap.
-      remaining.plans.push_back(factory_.plan_visits(std::move(visits)));
-    }
-    return DestroyedSolution{.remaining = std::move(remaining),
-                             .removed_customers = std::move(removed)};
+    return destroy_joint_occurrences(solution, std::move(removed));
   }
   auto sequences = remove_customers(solution, removed);
   Solution remaining =
@@ -4180,13 +4460,294 @@ DestroyedSolution Perturbation::destroy(const Solution& solution,
                            .removed_customers = std::move(removed)};
 }
 
+// User-authorized experimental extension: destroy only samples customers;
+// stations in the damaged customer blocks are subsequently movable tokens.
+DestroyedSolution Perturbation::destroy_joint_occurrences(
+    const Solution& solution, std::vector<int> removed_customers) {
+  const std::unordered_set<int> removed(removed_customers.begin(),
+                                        removed_customers.end());
+  DestroyedSolution result;
+  result.removed_customers = std::move(removed_customers);
+  for (std::size_t route = 0; route < solution.plans.size(); ++route) {
+    const auto& plan = solution.plans[route];
+    if (std::none_of(plan.customer_ids.begin(), plan.customer_ids.end(),
+                     [&](int id) { return removed.contains(id); })) {
+      result.remaining.plans.push_back(plan);
+      continue;
+    }
+    std::vector<int> visits;
+    visits.reserve(plan.route.visits.size());
+    std::size_t customer_gap = 0;
+    for (std::size_t visit = 0; visit < plan.route.visits.size(); ++visit) {
+      const int id = plan.route.visits[visit];
+      if (instance_.node(id).kind == NodeKind::Customer) {
+        if (!removed.contains(id)) visits.push_back(id);
+        ++customer_gap;
+      } else {
+        // A gap is inside a damaged consecutive-customer block exactly when
+        // either adjacent projected customer was removed. Depot boundaries
+        // are retained. Union the blocks by visiting each raw occurrence once.
+        const bool left = customer_gap != 0 &&
+            removed.contains(plan.customer_ids[customer_gap - 1]);
+        const bool right = customer_gap < plan.customer_ids.size() &&
+            removed.contains(plan.customer_ids[customer_gap]);
+        if (left || right) {
+          result.removed_stations.push_back({id, route, visit});
+        } else {
+          visits.push_back(id);
+        }
+      }
+    }
+    // All CS of a customer-empty route were extracted before normalization.
+    if (visits.empty()) continue;
+    if (factory_.has_adjacent_station_visits(visits)) {
+      throw std::logic_error("joint destruction created adjacent identical CS");
+    }
+    result.remaining.plans.push_back(factory_.plan_visits(std::move(visits)));
+  }
+  return result;
+}
+
+Solution Perturbation::repair_joint_occurrences(
+    const Solution& original, DestroyedSolution destroyed,
+    RepairOperator operation, double penalty_lambda) {
+  // Do not use the old customer-only decision tape: it has neither occurrence
+  // identity nor the additional station insertion steps.
+  last_joint_failure_.clear();
+  ++statistics_.joint_repair_calls;
+  statistics_.joint_removed_station_tokens += destroyed.removed_stations.size();
+  statistics_.joint_max_removed_station_tokens = std::max<std::uint64_t>(
+      statistics_.joint_max_removed_station_tokens, destroyed.removed_stations.size());
+  statistics_.joint_max_pending_tokens = std::max<std::uint64_t>(
+      statistics_.joint_max_pending_tokens,
+      destroyed.removed_customers.size() + destroyed.removed_stations.size());
+  struct Token {
+    int id;
+    bool station;
+    std::size_t source_route, source_visit;
+    std::size_t ordinal{};
+  };
+  std::vector<Token> pending;
+  for (int id : destroyed.removed_customers)
+    pending.push_back({id, false, 0, 0});
+  for (const auto& token : destroyed.removed_stations)
+    pending.push_back({token.station_id, true, token.source_route,
+                       token.source_visit});
+  for (std::size_t i = 0; i < pending.size(); ++i) pending[i].ordinal = i;
+  Solution current = std::move(destroyed.remaining);
+  // Active partial indices are stable under insertion. They need not equal
+  // original route indices after a customer-empty source route disappeared.
+  std::vector<std::vector<int>> retained;
+  for (const auto& p : current.plans) retained.push_back(p.route.visits);
+  const auto fallback = [&](const char* reason) {
+    last_joint_failure_ = reason;
+    if (last_joint_failure_ == "all_pending_tokens_blocked")
+      ++statistics_.joint_deadlock_rollbacks;
+    else ++statistics_.joint_invariant_rollbacks;
+    ++statistics_.station_conservation_checks;
+    ++statistics_.station_conservation_rollbacks;
+    ++statistics_.station_conservation_noops;
+    return original;
+  };
+  if (!destroyed.station_shells.empty()) return fallback("unexpected_station_shell");
+  std::vector<std::unique_ptr<PhysicalRouteScorer>> scorers;
+  scorers.reserve(current.plans.size() + destroyed.removed_customers.size());
+  for (const auto& p : current.plans) {
+    scorers.push_back(std::make_unique<PhysicalRouteScorer>(instance_, p));
+    ++statistics_.physical_route_profiles_built;
+  }
+  NonlinearSequenceEvaluator sequence(instance_);
+  // Per-repair ranks only: an unchanged route has the same full certificate,
+  // raw slots and lambda. No Plan/owner/key is retained by this workspace.
+  struct RouteRanks {
+    std::size_t version{};
+    std::size_t finite_count{};
+    std::size_t size{};
+    std::array<InsertionMove, 2> best;
+  };
+  const std::size_t route_capacity = current.plans.size() +
+                                     destroyed.removed_customers.size();
+  std::vector<RouteRanks> route_ranks;
+  if (route_capacity && pending.size() > route_ranks.max_size() / route_capacity)
+    throw std::length_error("joint insertion rank workspace is too large");
+  route_ranks.resize(pending.size() * route_capacity);
+  std::vector<std::size_t> route_versions(route_capacity, 0);
+  for (std::size_t r = 0; r < current.plans.size(); ++r) route_versions[r] = 1;
+  while (!pending.empty()) {
+    ++statistics_.physical_insertion_decisions;
+    std::optional<InsertionMove> chosen;
+    std::size_t chosen_token = 0;
+    double best_regret = -1.0;
+    for (std::size_t token_index = 0; token_index < pending.size(); ++token_index) {
+      const auto& token = pending[token_index];
+      std::vector<InsertionMove> moves;
+      moves.reserve(current.plans.size() * 2 + !token.station);
+      std::size_t logical_candidates = 0;
+      const auto make_move = [&](std::size_t route, std::size_t slot,
+                                 double incumbent, double cost) {
+        const double delta = cost - incumbent;
+        return InsertionMove{
+            .customer_id = token.id, .route_index = route, .position = slot,
+            .incumbent_route_cost = incumbent, .direct_delta = delta,
+            .linked_lower_bound_delta = delta, .delta = delta};
+      };
+      for (std::size_t route = 0; route < current.plans.size(); ++route) {
+        auto& ranks = route_ranks[token.ordinal * route_capacity + route];
+        if (ranks.version != route_versions[route]) {
+          ++statistics_.joint_rank_cache_misses;
+          ranks.finite_count = ranks.size = 0;
+          const auto append = [&](std::size_t slot, double incumbent, double cost) {
+            auto move = make_move(route, slot, incumbent, cost);
+            if (!std::isfinite(move.delta)) return;
+            ++ranks.finite_count;
+            ++statistics_.joint_rank_fresh_descriptors;
+            // Two distinct original positions survive even at exactly equal
+            // cost. The strict original tuple also keeps their slot order.
+            if (!ranks.size || insertion_better(move, ranks.best[0])) {
+              if (ranks.size) ranks.best[1] = ranks.best[0];
+              ranks.best[0] = std::move(move);
+              ranks.size = std::min<std::size_t>(2, ranks.size + 1);
+            } else if (ranks.size == 1 || insertion_better(move, ranks.best[1])) {
+              ranks.best[1] = std::move(move);
+              ranks.size = 2;
+            }
+          };
+          const auto& plan = current.plans[route];
+          const double incumbent = generalized_cost(*plan.evaluation, instance_,
+                                                    penalty_lambda);
+          std::optional<RouteCostSummary> summary;
+          std::size_t representative = plan.route.visits.size() + 1;
+          for (std::size_t slot = 0; slot <= plan.route.visits.size(); ++slot) {
+            if (token.station) {
+              if ((slot && plan.route.visits[slot - 1] == token.id) ||
+                  (slot < plan.route.visits.size() &&
+                   plan.route.visits[slot] == token.id)) continue;
+              auto visits = plan.route.visits;
+              visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(slot),
+                            token.id);
+              ++statistics_.joint_rank_score_calls;
+              append(slot, incumbent, sequence.generalized_cost(
+                  sequence.route_label(Route{std::move(visits)}), penalty_lambda));
+            } else {
+              const auto rep = scorers[route]->insertion_score_representative(slot);
+              if (!summary || rep != representative) {
+                ++statistics_.joint_rank_score_calls;
+                summary = scorers[route]->evaluate_insertion(slot, token.id);
+                representative = rep;
+              }
+              append(slot, incumbent,
+                     generalized_cost(*summary, instance_, penalty_lambda));
+            }
+          }
+          ranks.version = route_versions[route];
+        } else {
+          ++statistics_.joint_rank_cache_hits;
+          statistics_.joint_rank_reused_descriptors += ranks.finite_count;
+        }
+        logical_candidates += ranks.finite_count;
+        for (std::size_t i = 0; i < ranks.size; ++i) moves.push_back(ranks.best[i]);
+      }
+      if (!token.station) {
+        // Keep singleton scoring and its changing append-route index exactly
+        // where they were; only existing unchanged routes share ranks.
+        ++statistics_.joint_rank_score_calls;
+        auto singleton = make_move(current.plans.size(), 0, 0.0,
+            sequence.generalized_cost(sequence.route_label(Route{{token.id}}),
+                                       penalty_lambda));
+        if (std::isfinite(singleton.delta)) {
+          ++logical_candidates;
+          ++statistics_.joint_rank_fresh_descriptors;
+          moves.push_back(std::move(singleton));
+        }
+      }
+      statistics_.physical_insertion_candidates += logical_candidates;
+      if (moves.empty()) {
+        // A later customer insertion can create a separator for this station.
+        ++joint_blocked_token_scans_;
+        ++statistics_.joint_blocked_token_scans;
+        continue;
+      }
+      if (operation == RepairOperator::GreedyInsertion) {
+        const auto best = std::min_element(moves.begin(), moves.end(), insertion_better);
+        if (!chosen || insertion_better(*best, *chosen)) {
+          chosen = *best;
+          chosen_token = token_index;
+        }
+      } else {
+        const auto n = std::min<std::size_t>(2, moves.size());
+        std::partial_sort(moves.begin(), moves.begin() +
+            static_cast<std::ptrdiff_t>(n), moves.end(), insertion_better);
+        const double regret = n == 1 ? std::numeric_limits<double>::infinity()
+                                     : moves[1].delta - moves[0].delta;
+        if (!chosen || regret_better(regret, moves[0], best_regret, *chosen)) {
+          chosen = moves[0]; chosen_token = token_index; best_regret = regret;
+        }
+      }
+    }
+    if (!chosen) return fallback("all_pending_tokens_blocked");
+    const auto started = std::chrono::steady_clock::now();
+    const auto token = pending[chosen_token];
+    const auto route = chosen->route_index;
+    std::vector<int> visits;
+    if (route < current.plans.size()) visits = current.plans[route].route.visits;
+    else if (token.station) return fallback("station_singleton_forbidden");
+    visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(chosen->position), token.id);
+    if (factory_.has_adjacent_station_visits(visits)) return fallback("adjacent_station_candidate");
+    apply_insertion(current, route, factory_.plan_visits(std::move(visits)));
+    ++route_versions.at(route);
+    if (token.station) {
+      ++joint_station_insertions_;
+      ++statistics_.joint_station_insertion_attempts;
+    } else {
+      ++joint_customer_insertions_;
+      ++statistics_.joint_customer_insertion_attempts;
+    }
+    // Erase exactly one occurrence, even if several tokens share a station ID.
+    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(chosen_token));
+    if (!pending.empty()) {
+      auto updated = std::make_unique<PhysicalRouteScorer>(instance_, current.plans[route]);
+      if (route == scorers.size()) scorers.push_back(std::move(updated));
+      else scorers[route] = std::move(updated);
+      ++statistics_.physical_route_profiles_built;
+    }
+    statistics_.repair_timing.winner_materialization_s += elapsed_seconds(started);
+  }
+  const auto counts = [&](const Solution& s) {
+    std::map<int, std::size_t> result;
+    for (const auto& p : s.plans)
+      for (int id : p.route.visits) ++result[id];
+    return result;
+  };
+  if (counts(original) != counts(current)) return fallback("occurrence_conservation");
+  for (std::size_t route = 0; route < current.plans.size(); ++route) {
+    const auto& p = current.plans[route];
+    if (p.customer_ids.empty() || factory_.has_adjacent_station_visits(p.route.visits))
+      return fallback("invalid_completed_route");
+    if (route < retained.size()) {
+      std::size_t i = 0;
+      for (int id : p.route.visits)
+        if (i < retained[route].size() && id == retained[route][i]) ++i;
+      if (i != retained[route].size()) return fallback("retained_subsequence_changed");
+    }
+  }
+  current.validate_partition(instance_);
+  ++statistics_.station_conservation_checks;
+  bool unchanged = current.plans.size() == original.plans.size();
+  for (std::size_t r = 0; unchanged && r < current.plans.size(); ++r)
+    unchanged = current.plans[r].route.visits == original.plans[r].route.visits;
+  if (unchanged) ++statistics_.station_conservation_noops;
+  else ++statistics_.station_conservation_effective;
+  return current;
+}
+
 Solution Perturbation::repair(DestroyedSolution destroyed,
                               RepairOperator operation,
                               double penalty_lambda,
-                              std::vector<InsertionPathHint>* hints) {
+                              std::vector<InsertionPathHint>* hints,
+                              RepairDecisionMemo* memo) {
   if (preserve_station_visits_) {
     return repair_preserving_stations(std::move(destroyed), operation,
-                                      penalty_lambda);
+                                      penalty_lambda, memo);
   }
   Solution current = std::move(destroyed.remaining);
   std::vector<int> unassigned = std::move(destroyed.removed_customers);
@@ -4318,30 +4879,60 @@ Solution Perturbation::repair(DestroyedSolution destroyed,
 
 Solution Perturbation::repair_preserving_stations(
     DestroyedSolution destroyed, RepairOperator operation,
-    double penalty_lambda) {
+    double penalty_lambda, RepairDecisionMemo* memo) {
+  const auto replay = memo ? memo->find(destroyed, operation, statistics_) : std::nullopt;
+  std::optional<RepairDecisionMemo::Entry> recording;
+  if (memo && memo->active && !replay) recording = memo->input(destroyed, operation);
+  const auto candidates_before = statistics_.physical_insertion_candidates;
+  const auto profiles_before = statistics_.physical_route_profiles_built;
+  std::size_t replay_index = 0;
   Solution current = std::move(destroyed.remaining);
   std::vector<int> unassigned = std::move(destroyed.removed_customers);
+  auto station_shells = std::move(destroyed.station_shells);
   std::vector<std::unique_ptr<PhysicalRouteScorer>> scorers;
   scorers.reserve(current.plans.size() + unassigned.size());
-  for (const Plan& plan : current.plans) {
+  if (!replay) for (const Plan& plan : current.plans) {
     scorers.push_back(std::make_unique<PhysicalRouteScorer>(instance_, plan));
     ++statistics_.physical_route_profiles_built;
   }
   NonlinearSequenceEvaluator singleton_scorer(instance_);
   while (!unassigned.empty()) {
+    // Each nonempty dormant shell must receive a customer before the final
+    // station-conservation guard. Once customers and shells are equally
+    // numerous, any nonactivation would make that completion impossible.
+    // Shells remain inactive at zero cost; activation still pays the full route.
+    const std::size_t pending_shells = std::count_if(
+        station_shells.begin(), station_shells.end(),
+        [](const auto& shell) { return !shell.empty(); });
+    const bool must_activate_shell = unassigned.size() == pending_shells;
     ++statistics_.physical_insertion_decisions;
     std::optional<InsertionMove> chosen;
     double best_regret = -1.0;
-    for (const int customer : unassigned) {
+    if (replay) {
+      const auto& step = replay->steps[replay_index++];
+      chosen = InsertionMove{.customer_id = step.customer,
+                             .route_index = step.route, .position = step.slot};
+    } else for (const int customer : unassigned) {
       std::vector<InsertionMove> moves;
-      for (std::size_t route = 0; route < current.plans.size(); ++route) {
+      for (std::size_t route = 0;
+           !must_activate_shell && route < current.plans.size(); ++route) {
         const Plan& plan = current.plans[route];
         const double incumbent = generalized_cost(
             *plan.evaluation, instance_, penalty_lambda);
+        // A score is retained only within this fixed route/customer scan.
+        // Keep every descriptor, so Greedy ties and TwoRegret multiplicity
+        // are exactly those of the original full physical-slot enumeration.
+        std::optional<RouteCostSummary> insertion_summary;
+        std::size_t summary_representative = plan.route.visits.size()+1;
         for (std::size_t slot = 0; slot <= plan.route.visits.size(); ++slot) {
+          const std::size_t representative =
+              scorers[route]->insertion_score_representative(slot);
+          if (!insertion_summary || representative != summary_representative) {
+            insertion_summary = scorers[route]->evaluate_insertion(slot, customer);
+            summary_representative = representative;
+          }
           const double delta = generalized_cost(
-              scorers[route]->evaluate_insertion(slot, customer), instance_,
-              penalty_lambda) - incumbent;
+              *insertion_summary, instance_, penalty_lambda) - incumbent;
           moves.push_back(InsertionMove{.customer_id = customer,
                                         .route_index = route,
                                         .position = slot,
@@ -4351,15 +4942,36 @@ Solution Perturbation::repair_preserving_stations(
                                         .delta = delta});
         }
       }
-      const double singleton_cost = singleton_scorer.generalized_cost(
-          singleton_scorer.route_label(Route{{customer}}), penalty_lambda);
-      moves.push_back(InsertionMove{.customer_id = customer,
-                                    .route_index = current.plans.size(),
-                                    .position = 0,
-                                    .incumbent_route_cost = 0.0,
-                                    .direct_delta = singleton_cost,
-                                    .linked_lower_bound_delta = singleton_cost,
-                                    .delta = singleton_cost});
+      // A dormant shell is charged only after its first customer activates it.
+      // Score the full activated route, never a delta from a phantom CS route.
+      for (std::size_t shell = 0; shell < station_shells.size(); ++shell) {
+        if (station_shells[shell].empty()) continue;
+        std::unordered_set<std::vector<int>, IntVectorHash> distinct_activations;
+        for (std::size_t slot = 0; slot <= station_shells[shell].size(); ++slot) {
+          auto visits = station_shells[shell];
+          visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(slot), customer);
+          // Preserve every inherited CS occurrence, matching destruction and
+          // the exact conservation guard. Deduplicate only identical vectors.
+          if (!distinct_activations.insert(visits).second) continue;
+          const double cost = singleton_scorer.generalized_cost(
+              singleton_scorer.route_label(Route{std::move(visits)}), penalty_lambda);
+          moves.push_back(InsertionMove{.customer_id = customer,
+              .route_index = current.plans.size() + shell, .position = slot,
+              .incumbent_route_cost = 0.0, .direct_delta = cost,
+              .linked_lower_bound_delta = cost, .delta = cost});
+        }
+      }
+      if (!must_activate_shell) {
+        const double singleton_cost = singleton_scorer.generalized_cost(
+            singleton_scorer.route_label(Route{{customer}}), penalty_lambda);
+        moves.push_back(InsertionMove{.customer_id = customer,
+                                      .route_index = current.plans.size() + station_shells.size(),
+                                      .position = 0,
+                                      .incumbent_route_cost = 0.0,
+                                      .direct_delta = singleton_cost,
+                                      .linked_lower_bound_delta = singleton_cost,
+                                      .delta = singleton_cost});
+      }
       statistics_.physical_insertion_candidates += moves.size();
       if (operation == RepairOperator::GreedyInsertion) {
         const auto best = std::min_element(moves.begin(), moves.end(),
@@ -4378,16 +4990,28 @@ Solution Perturbation::repair_preserving_stations(
         }
       }
     }
+    if (recording) recording->steps.push_back(
+        {chosen->customer_id, chosen->route_index, chosen->position});
     const auto started = std::chrono::steady_clock::now();
-    const std::size_t route = chosen->route_index;
+    std::size_t route = chosen->route_index;
     const int customer = chosen->customer_id;
-    std::vector<int> visits = route == current.plans.size()
-        ? std::vector<int>{} : current.plans[route].route.visits;
+    std::vector<int> visits;
+    if (route < current.plans.size()) {
+      visits = current.plans[route].route.visits;
+    } else {
+      const std::size_t shell = route - current.plans.size();
+      if (shell < station_shells.size()) {
+        visits = std::move(station_shells[shell]);
+        station_shells[shell].clear();
+        ++statistics_.station_shells_activated;
+      }
+      route = current.plans.size();
+    }
     visits.insert(visits.begin() + static_cast<std::ptrdiff_t>(chosen->position),
                   customer);
     apply_insertion(current, route, factory_.plan_visits(std::move(visits)));
     std::erase(unassigned, customer);
-    if (!unassigned.empty()) {
+    if (!replay && !unassigned.empty()) {
       auto updated = std::make_unique<PhysicalRouteScorer>(instance_, current.plans[route]);
       if (route == scorers.size()) scorers.push_back(std::move(updated));
       else scorers[route] = std::move(updated);
@@ -4395,11 +5019,58 @@ Solution Perturbation::repair_preserving_stations(
     }
     statistics_.repair_timing.winner_materialization_s += elapsed_seconds(started);
   }
+  statistics_.station_shells_discarded += std::count_if(
+      station_shells.begin(), station_shells.end(),
+      [](const auto& shell) { return !shell.empty(); });
   current.validate_partition(instance_);
+  if (recording) {
+    recording->candidates = statistics_.physical_insertion_candidates - candidates_before;
+    recording->profiles = statistics_.physical_route_profiles_built - profiles_before;
+    memo->put(std::move(*recording), statistics_);
+  }
   return current;
 }
 
+Solution Perturbation::enforce_station_conservation(
+    const Solution& original, Solution repaired,
+    const std::vector<std::vector<int>>& expected_station_chains) {
+  ++statistics_.station_conservation_checks;
+  // Route indices can change when dormant shells reactivate. Compare a
+  // multiset of full ordered CS sequences, with exact vector equality after
+  // hashing; station-free routes do not carry a charging skeleton.
+  const auto skeletons = [&](const Solution& input) {
+    std::unordered_map<std::vector<int>, std::size_t, IntVectorHash> counts;
+    counts.reserve(input.plans.size());
+    for (const Plan& plan : input.plans) {
+      std::vector<int> stations;
+      for (const int id : plan.route.visits) {
+        if (instance_.node(id).kind == NodeKind::Station) stations.push_back(id);
+      }
+      if (!stations.empty()) ++counts[std::move(stations)];
+    }
+    return counts;
+  };
+  std::unordered_map<std::vector<int>, std::size_t, IntVectorHash> expected;
+  for(const auto& chain:expected_station_chains)if(!chain.empty())++expected[chain];
+  if (expected != skeletons(repaired)) {
+    // No resampling, CS replacement, phantom route or alternative pricing.
+    // The caller's original fully evaluated solution is the bounded fallback.
+    ++statistics_.station_conservation_rollbacks;
+    ++statistics_.station_conservation_noops;
+    return original;
+  }
+  bool unchanged = original.plans.size() == repaired.plans.size();
+  for (std::size_t route = 0; unchanged && route < original.plans.size(); ++route) {
+    unchanged = original.plans[route].route.visits == repaired.plans[route].route.visits;
+  }
+  if (unchanged) ++statistics_.station_conservation_noops;
+  else ++statistics_.station_conservation_effective;
+  return repaired;
+}
+
 Solution Perturbation::apply(const Solution& solution, double penalty_lambda) {
+  if (!preserve_station_visits_ && repair_decision_memo_)
+    repair_decision_memo_->begin(solution, penalty_lambda, statistics_);
   last_removal_count_ = 0;
   const std::size_t customers = instance_.customer_ids().size();
   const std::size_t lower = std::min<std::size_t>(customers, 3);
@@ -4417,9 +5088,13 @@ Solution Perturbation::apply(const Solution& solution, double penalty_lambda) {
       destroy(solution, destroy_operation, removal_count, penalty_lambda);
   last_removal_count_ = destroyed.removed_customers.size();
   statistics_.repair_timing.destroy_s += elapsed_seconds(destroy_started);
+  if (preserve_station_visits_) {
+    return repair_joint_occurrences(solution, std::move(destroyed),
+                                    repair_operation, penalty_lambda);
+  }
   Solution repaired = repair(
       std::move(destroyed), repair_operation, penalty_lambda,
-      uses_granular_topology(profile_) ? &hints : nullptr);
+      uses_granular_topology(profile_) ? &hints : nullptr, repair_decision_memo_.get());
   if (!uses_granular_topology(profile_) || hints.empty()) return repaired;
   const auto post_hint_started = std::chrono::steady_clock::now();
   HintedPathResult hinted = path_sampler_.apply_insertion_hints(
@@ -4505,6 +5180,7 @@ Solution VariableNeighborhoodDescent::improve(
       std::numeric_limits<std::size_t>::max();
   struct CooperativePathState {
     std::size_t remaining{};
+    detail::RouteOpeningRpReserve opening_reserve;
     std::vector<std::pair<std::size_t, std::size_t>> gaps;
     std::size_t next_gap{};
     bool selector_valid{};
@@ -4522,6 +5198,9 @@ Solution VariableNeighborhoodDescent::improve(
     // min(G_entry, 2*kappa), without overflowing the doubling operation.
     cooperative->remaining = entry_allowance +
         std::min(*cooperative_removal_count, entry_gap_count - entry_allowance);
+    cooperative->opening_reserve.initialize(cooperative->remaining);
+    entry_allowance = std::min(entry_allowance,
+        cooperative->opening_reserve.ordinary_allowance(cooperative->remaining));
     ++statistics_.cooperative_vnd_calls;
     statistics_.cooperative_proposal_budget += cooperative->remaining;
   }
@@ -4583,7 +5262,8 @@ Solution VariableNeighborhoodDescent::improve(
     return solution;
   }
 
-  const auto cooperative_neighbor = [&](std::size_t allowance, bool entry_phase)
+  const auto cooperative_neighbor = [&](std::size_t allowance, bool entry_phase,
+                                        bool opening_guidance = false)
       -> std::optional<Solution> {
     ++statistics_.replace_path_calls;
     auto& state = *cooperative;
@@ -4625,11 +5305,35 @@ Solution VariableNeighborhoodDescent::improve(
       if (path_sampler_.catalog_disk_cache_.enabled) {
         before_catalogue_read.emplace(random_);
       }
-      // Half the draws favor gaps on routes with an actual retained energy
-      // shortfall; half remain uniform over every unvisited gap. If neither
-      // branch can differ, preserve the legacy draw and its RNG consumption.
+      // Only the first entry proposal and opening-owned token may use the proxy.
+      // The uniform half reaches the original draw without any catalogue scan.
+      std::optional<PathSampler::BoundedProxyChoice> guided;
+      // Energy-repair guidance is inapplicable to fully feasible or time-only
+      // states. Bypass before the coin so those proposals keep exact f0 RNG.
+      if ((opening_guidance || entry_phase) && attempt == 0 &&
+          std::any_of(solution.plans.begin(), solution.plans.end(),
+              [](const Plan& p) {
+                return p.evaluation->energy_shortfall_wh > kEnergyToleranceWh;
+              })) {
+        const auto before_hint = random_;
+        try {
+          if (std::bernoulli_distribution(0.5)(random_)) {
+            auto scan = path_sampler_.bounded_proxy_choice(
+                solution, state.gaps, state.next_gap, penalty_lambda);
+            guided = std::move(scan.choice);
+            // No partial/capped scan may select a proposal. Restore the coin
+            // on unsupported scope so fallback is the literal old RNG draw.
+            if (!guided) random_ = before_hint;
+          }
+        } catch (...) {
+          random_ = before_hint;
+          throw;
+        }
+      }
+      // Uniform fallback: one uniformly random unvisited gap,
+      // followed by one uniformly random noncurrent catalogue path. The typed
+      // direct-deletion entry is disabled by this candidate's build contract.
       // BEGIN_DEFICIT_GAP_DRAW
-      const std::size_t unvisited = state.gaps.size() - state.next_gap;
 #if ILS_SP_TYPED_DELETE_ENTRY
       const bool typed_deletion = entry_phase && attempt == 0 &&
           !deletion_positions.empty();
@@ -4639,18 +5343,12 @@ Solution VariableNeighborhoodDescent::improve(
             0, deletion_positions.size() - 1)(random_)];
       } else {
 #endif
-      const bool favor_deficit = !state.deficit_positions.empty() &&
-          state.deficit_positions.size() < unvisited &&
-          std::bernoulli_distribution(0.5)(random_);
 #if ILS_SP_TYPED_DELETE_ENTRY
-      selected = favor_deficit
+      selected = guided ? guided->position : std::uniform_int_distribution<std::size_t>(
 #else
-      const std::size_t selected = favor_deficit
+      const std::size_t selected = guided ? guided->position : std::uniform_int_distribution<std::size_t>(
 #endif
-          ? state.deficit_positions[std::uniform_int_distribution<std::size_t>(
-                0, state.deficit_positions.size() - 1)(random_)]
-          : std::uniform_int_distribution<std::size_t>(
-                state.next_gap, state.gaps.size() - 1)(random_);
+          state.next_gap, state.gaps.size() - 1)(random_);
 #if ILS_SP_TYPED_DELETE_ENTRY
       }
 #endif
@@ -4694,15 +5392,16 @@ Solution VariableNeighborhoodDescent::improve(
                                                         : plan.customer_ids[gap];
       std::optional<std::vector<int>> sampled;
       try {
-        // One indexed uniform alternative, excluding every copy of the old
-        // path exactly as in legacy RP. No all-alternative scoring occurs.
+        // Guided winner is an existing noncurrent catalogue path. Otherwise
+        // use the exact indexed uniform sampler. Only this path is full-scored.
 #if ILS_SP_TYPED_DELETE_ENTRY
         if (typed_deletion) {
           sampled.emplace();  // The catalogue direct path, not a charging repair.
         } else
 #endif
         {
-        sampled = path_sampler_.sample_explicit_path(origin, target, plan.gaps[gap]);
+        if (guided) sampled = std::move(guided->stations);
+        else sampled = path_sampler_.sample_explicit_path(origin, target, plan.gaps[gap]);
         }
       } catch (...) {
         // Match legacy RP's rollback of the gap draw on a failed disk read.
@@ -4748,26 +5447,58 @@ Solution VariableNeighborhoodDescent::improve(
   // still choose the first remaining bit, preserving their fixed-order RNG.
   const auto active_neighborhoods = [&]() {
     unsigned int active = (1U << order_.size()) - 1U;
-    if (cooperative.has_value() && cooperative->remaining == 0) {
-      active &= ~(1U << 3);  // RP has no tokens; never refill on a restart.
+    if (cooperative.has_value() &&
+        cooperative->opening_reserve.ordinary_allowance(cooperative->remaining) == 0) {
+      active &= ~(1U << 3);  // Protect the one event-or-stagnation token.
     }
     return active;
   };
   unsigned int remaining = active_neighborhoods();
-  while (remaining != 0 && !expired(deadline)) {
+  while ((remaining != 0 ||
+          (cooperative.has_value() && cooperative->opening_reserve.held)) &&
+         !expired(deadline)) {
+    if (remaining == 0) {
+      // No route-opening event used the reserved token. Release it once after
+      // normal stagnation; failure ends, strict acceptance restarts the same
+      // invocation without repeating entry or replenishing any token.
+      cooperative->opening_reserve.release();
+      auto tail = cooperative_neighbor(1, false);
+      if (expired(deadline) || !accept(std::move(tail))) break;
+      remaining = active_neighborhoods();
+      ++statistics_.rvnd_improvement_resets;
+      continue;
+    }
     const std::size_t neighborhood_index = cooperative.has_value()
         ? select_active_neighborhood(remaining)
         : static_cast<std::size_t>(std::countr_zero(remaining));
     if (cooperative.has_value()) ++statistics_.rvnd_neighborhood_selections;
+    const std::size_t previous_route_count = solution.plans.size();
     auto best = cooperative.has_value() &&
                         order_[neighborhood_index] == Neighborhood::ReplacePath
-        ? cooperative_neighbor(cooperative->remaining, false)
+        ? cooperative_neighbor(cooperative->opening_reserve.ordinary_allowance(
+              cooperative->remaining), false)
         : best_neighbor(solution, order_[neighborhood_index],
                         penalty_lambda, deadline, cooperative.has_value());
     if (expired(deadline)) break;
     if (accept(std::move(best))) {
       remaining = active_neighborhoods();
       if (cooperative.has_value()) ++statistics_.rvnd_improvement_resets;
+      if (cooperative.has_value() &&
+          order_[neighborhood_index] != Neighborhood::ReplacePath &&
+          cooperative->opening_reserve.release_on_opening(
+              previous_route_count, solution.plans.size())) {
+        // One proxy-guided or uniform RP proposal after the first strictly
+        // accepted customer route opening. This consumes an existing token;
+        // RP itself cannot trigger another opening event or refill the holder.
+        auto opening = cooperative_neighbor(1, false, true);
+        if (expired(deadline)) break;
+        if (accept(std::move(opening))) {
+          ++statistics_.rvnd_improvement_resets;
+        }
+        // A failed reserved probe retires its gap, not the ordinary RP bit.
+        // The accepted customer move already reopened every neighborhood.
+        remaining = active_neighborhoods();
+      }
     } else {
       remaining &= ~(1U << neighborhood_index);
     }
@@ -5047,13 +5778,10 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
       }
     }
   }
-  // Unsupported metadata must never hit or publish a remembered descriptor.
-  // Bound identity payload by physical length; weak evaluation owners retain
-  // no charge/SOC vectors. Registry eviction assigns a new, never recycled ID.
-  if (!canonical_physical_input || std::any_of(
-          solution.plans.begin(), solution.plans.end(), [](const Plan& plan) {
-            return plan.route.visits.size() > 256;
-          })) {
+  // Unsupported metadata still invalidates the whole pass. Physical-length
+  // limits are isolated below to the supports that actually touch a long route.
+  // Weak evaluation owners retain no charge/SOC vectors.
+  if (!canonical_physical_input) {
     move_memory_.clear();
     route_versions_.clear();
     next_route_version_ = 1;
@@ -5071,6 +5799,9 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     }
     for (std::size_t route = 0; route < current.size(); ++route) {
       const Plan& plan = solution.plans[route];
+      // Zero is an uncacheable support version, never a shared long-route ID.
+      // Keep the existing bounded raw key domain; do not retain long keys.
+      if (plan.route.visits.size() > 256) continue;
       const auto known = route_versions_.get(plan.route.visits);
       if (known.has_value() && known->evaluation.lock() == plan.evaluation) {
         current_route_versions[route] = known->id;
@@ -5249,6 +5980,14 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     return key;
   };
 
+  const auto can_remember_support = [&](const MoveMemoryKey& key) {
+    if (!move_memory_usable_) return false;
+    for (std::size_t index = 0; index < key.route_count; ++index) {
+      if (key.route_versions[index] == 0) return false;
+    }
+    return true;
+  };
+
   // Vidal's route-pair move memory is useful only if it is consulted before
   // rebuilding every customer-level move on unchanged routes.  Remember the
   // first lookup for each support in this neighborhood pass, then skip all of
@@ -5260,7 +5999,7 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
     SupportWorkingMemory& memory = support_memory(index);
     if (memory.state == SupportState::Unknown) {
       MoveMemoryKey key = support_key(first, second, opens_route);
-      const auto cached = move_memory_usable_
+      const auto cached = can_remember_support(key)
           ? move_memory_.get(key) : std::nullopt;
       if (cached.has_value()) {
         memory.active = true;
@@ -5373,8 +6112,14 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   const auto physical_two_opt_profile = [&](std::size_t route)
       -> const PhysicalReverseTwoOptProfile& {
     auto& profile = two_opt_profiles.at(route);
-    if (!profile) profile = std::make_unique<PhysicalReverseTwoOptProfile>(
-        instance_, solution.plans.at(route), opening_evaluator);
+    if (!profile) {
+      profile = std::make_unique<PhysicalReverseTwoOptProfile>(
+          instance_, solution.plans.at(route), opening_evaluator);
+#if ILS_SP_FORWARD_ONLY_TWO_OPT
+      statistics_.two_opt_reverse_label_slots_saved +=
+          2 * (solution.plans.at(route).route.visits.size() + 1);
+#endif
+    }
     return *profile;
   };
   // Reuse only accumulator storage within this sequential neighborhood pass.
@@ -5440,7 +6185,14 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
                              penalty_lambda).has_value();
   // Construct a route profile only on a physical-summary miss. Reuse it while
   // this route slot's entire physical sequence is unchanged, including CS.
+  // The solution and route_count are immutable throughout this best-neighbor
+  // pass. Validate each persistent profile once, then reuse its stable slot.
+  std::vector<unsigned char> swap_profile_ready(route_count, 0);
   const auto swap_profile = [&](std::size_t route) -> SwapPhysicalProfile& {
+    if (swap_profile_ready.at(route)) {
+      ++statistics_.physical_profile_repeat_checks_saved;
+      return swap_profiles_.at(route);
+    }
     if (swap_profiles_.size() != route_count) swap_profiles_.resize(route_count);
     auto& profile = swap_profiles_.at(route);
     const Plan& plan = solution.plans.at(route);
@@ -5455,6 +6207,7 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
       fresh.scorer = std::make_unique<PhysicalRouteScorer>(instance_, plan, true);
       profile = std::move(fresh);
     }
+    swap_profile_ready[route] = 1;
     return profile;
   };
   const auto mark_physical_relocate = [&](std::size_t source_route,
@@ -6041,8 +6794,8 @@ std::optional<Solution> VariableNeighborhoodDescent::best_customer_neighbor(
   for (std::size_t support = 0; support < support_count; ++support) {
     SupportWorkingMemory& memory = support_working_memory_[support];
     if (memory.epoch != support_epoch_ || !memory.active) continue;
-    if (move_memory_usable_ && memory.state != SupportState::Closed &&
-        neighborhood_completed) {
+    if (can_remember_support(memory.key) &&
+        memory.state != SupportState::Closed && neighborhood_completed) {
       move_memory_.put(memory.key, memory.entry);
     }
     double delta = memory.entry.candidate_cost;

@@ -16,6 +16,9 @@ namespace ils_sp {
 struct ChargingSequenceLeg {
   int station_id{};
   double energy_from_previous_station_wh{};
+  // Proof from a real physical edge, never inferred from zero energy.
+  // False by default for externally assembled labels with no adjacency proof.
+  bool physical_same_station_predecessor{};
 };
 
 // Associative resource label for a physical visit subsequence.  Customers
@@ -29,6 +32,29 @@ struct ChargingSequenceLabel {
   double tail_energy_wh{};
   double travel_time_h{};
   double service_time_h{};
+};
+
+// Non-owning, exactly ordered label storage. The first leg may carry a
+// different accumulated energy for a suffix starting inside one station leg.
+// Occurrences are never removed; the existing evaluator expands every leg.
+struct ChargingSequenceView {
+  bool initialized{};
+  int origin_id{};
+  int target_id{};
+  std::span<const ChargingSequenceLeg> station_legs;
+  double first_energy_wh{};
+  double tail_energy_wh{};
+  double travel_time_h{};
+  double service_time_h{};
+
+  ChargingSequenceView() = default;
+  ChargingSequenceView(const ChargingSequenceLabel& label)
+      : initialized(label.initialized), origin_id(label.origin_id),
+        target_id(label.target_id), station_legs(label.station_legs),
+        first_energy_wh(label.station_legs.empty() ? 0.0 :
+                        label.station_legs.front().energy_from_previous_station_wh),
+        tail_energy_wh(label.tail_energy_wh), travel_time_h(label.travel_time_h),
+        service_time_h(label.service_time_h) {}
 };
 
 struct RouteCostSummary {
@@ -86,6 +112,8 @@ class NonlinearSequenceEvaluator {
       const ChargingSequenceLabel& route) const;
   [[nodiscard]] RouteCostSummary evaluate(
       std::span<const ChargingSequenceLabel* const> components) const;
+  [[nodiscard]] RouteCostSummary evaluate(
+      std::span<const ChargingSequenceView> components) const;
   [[nodiscard]] double generalized_cost(
       const ChargingSequenceLabel& route, double penalty_lambda) const;
   [[nodiscard]] double generalized_cost(
@@ -193,9 +221,11 @@ class PlanFactory {
   [[nodiscard]] Plan make_plan(
       std::vector<int> customer_ids,
       std::vector<std::vector<int>> gaps);
-  // Preserve physical station occurrences, including repeats created when
-  // customer removal joins two formerly distinct charging paths.
+  // User-selected representation: adjacent identical physical stations are
+  // merged; occurrences separated by a customer or another station survive.
   [[nodiscard]] Plan plan_visits(std::vector<int> visits);
+  [[nodiscard]] bool has_adjacent_station_visits(std::span<const int> visits) const;
+  bool normalize_adjacent_station_visits(std::vector<int>& visits) const;
   [[nodiscard]] Plan plan_sequence(const std::vector<int>& customer_ids,
                                    const Solution* reference = nullptr);
   [[nodiscard]] Plan plan_sequence(const std::vector<int>& customer_ids,
@@ -240,6 +270,9 @@ class PhysicalRouteScorer {
  public:
   PhysicalRouteScorer(const Instance& instance, const Plan& plan,
                       bool support_swaps = false);
+  PhysicalRouteScorer(const PhysicalRouteScorer&) = delete;
+  PhysicalRouteScorer& operator=(const PhysicalRouteScorer&) = delete;
+  PhysicalRouteScorer(PhysicalRouteScorer&&) = default;
   [[nodiscard]] RouteCostSummary evaluate_replacement(
       std::size_t physical_customer_position, int customer_id) const;
   [[nodiscard]] RouteCostSummary evaluate_swap(
@@ -252,6 +285,11 @@ class PhysicalRouteScorer {
       std::size_t physical_customer_position, std::size_t original_physical_slot) const;
   [[nodiscard]] RouteCostSummary evaluate_insertion(
       std::size_t physical_slot, int customer_id) const;
+  // Equal representatives certify bit-identical canonical insertion inputs
+  // for one fixed unvisited customer. They never change raw slot identities.
+  [[nodiscard]] std::size_t insertion_score_representative(
+      std::size_t physical_slot) const;
+
   [[nodiscard]] RouteCostSummary evaluate_removal(
       std::size_t physical_customer_position) const;
 
@@ -261,8 +299,14 @@ class PhysicalRouteScorer {
   // Includes the implicit departure and return depot at the two ends.
   std::vector<int> nodes_;
   std::unordered_set<int> customers_;
-  std::vector<ChargingSequenceLabel> prefixes_;
-  std::vector<ChargingSequenceLabel> suffixes_;
+  friend struct PhysicalRouteScorerTestAccess;
+  // Views are bound to these immutable, reserved arrays after construction.
+  // Prefix and suffix energies retain their distinct original summation order.
+  std::vector<ChargingSequenceLeg> prefix_station_legs_;
+  std::vector<ChargingSequenceLeg> suffix_station_legs_;
+  std::vector<ChargingSequenceView> prefixes_;
+  std::vector<ChargingSequenceView> suffixes_;
+  std::vector<std::size_t> insertion_score_representatives_;
   // Optional immutable range labels for the unchanged interior of an intra
   // Swap. Existing LNS insertion/removal callers do not build this tree.
   std::size_t swap_range_base_{};

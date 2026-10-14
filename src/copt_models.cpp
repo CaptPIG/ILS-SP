@@ -1,13 +1,16 @@
 #include "ils_sp/copt_models.hpp"
 #include "ils_sp/detail/copt_result_validation.hpp"
+#include "ils_sp/detail/input_contract.hpp"
 #include "callbackbase.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <limits>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -53,8 +56,7 @@ struct ModelTimeBudget {
     std::optional<double> maximum_wall_time_s) {
   if (!maximum_wall_time_s.has_value()) return deadline;
   const auto local_deadline =
-      start + std::chrono::duration_cast<ModelClock::duration>(
-                  std::chrono::duration<double>(*maximum_wall_time_s));
+      detail::checked_deadline_after<ModelClock>(start, *maximum_wall_time_s);
   if (!deadline.has_value() || local_deadline < *deadline) {
     return local_deadline;
   }
@@ -115,6 +117,7 @@ using detail::finite_copt_value;
 [[nodiscard]] bool rounded_target_reached(
     double objective_h, std::optional<double> rounded_target_objective_h) {
   return rounded_target_objective_h.has_value() &&
+         detail::roundable_objective(objective_h) &&
          std::llround(objective_h * 100.0) <=
              std::llround(*rounded_target_objective_h * 100.0);
 }
@@ -177,6 +180,11 @@ struct FrvcpRouteLowerBound {
   double service_time_h{};
 };
 
+struct FrvcpStationSpan {
+  std::size_t first{};
+  std::size_t last{};
+};
+
 struct FrvcpPathSpec {
   std::vector<int> stations;
   std::vector<double> leg_energy_wh;
@@ -186,6 +194,8 @@ struct FrvcpPathSpec {
   std::size_t fastest_curve_rank{};
   std::size_t slowest_curve_rank{};
   bool required_for_start{};
+  // Model-only spans; external path occurrences and catalog identity stay intact.
+  std::vector<FrvcpStationSpan> model_station_spans;
 };
 
 struct FrvcpGapPathCatalog {
@@ -227,17 +237,51 @@ void saturating_add(std::size_t& value, std::size_t increment) {
       }
     }
   }
+  // Pairwise epsilon equivalence is not transitive and cannot be used by
+  // std::sort. Compare exact finite signatures on one common energy grid.
+  // Tolerance remains only in the separate dominance validation below.
+  std::vector<double> energy_breakpoints;
+  for (const auto& type : curve_types) {
+    for (const ChargingPoint& point : instance.charging_curves().at(type).points()) {
+      energy_breakpoints.push_back(point.energy_wh);
+    }
+  }
+  std::sort(energy_breakpoints.begin(), energy_breakpoints.end());
+  energy_breakpoints.erase(
+      std::unique(energy_breakpoints.begin(), energy_breakpoints.end()),
+      energy_breakpoints.end());
+  std::map<std::string, std::vector<double>> curve_signatures;
+  for (const auto& type : curve_types) {
+    const ChargingCurve& curve = instance.charging_curves().at(type);
+    auto& signature = curve_signatures[type];
+    for (std::size_t index = 1; index < energy_breakpoints.size(); ++index) {
+      const double duration = curve.charge_duration(
+          energy_breakpoints[index - 1], energy_breakpoints[index]);
+      if (!std::isfinite(duration)) {
+        throw std::invalid_argument("charging curve ordering requires finite durations");
+      }
+      signature.push_back(duration);
+    }
+  }
   std::sort(curve_types.begin(), curve_types.end(),
             [&](const std::string& left, const std::string& right) {
-              const bool left_no_slower = charging_curve_no_slower(
-                  instance.charging_curves().at(left),
-                  instance.charging_curves().at(right));
-              const bool right_no_slower = charging_curve_no_slower(
-                  instance.charging_curves().at(right),
-                  instance.charging_curves().at(left));
-              if (left_no_slower != right_no_slower) return left_no_slower;
+              const auto& first = curve_signatures.at(left);
+              const auto& second = curve_signatures.at(right);
+              if (first != second) return first < second;
               return left < right;
             });
+  // A rank is consumed as a total dominance chain. Validate every pair:
+  // adjacent epsilon comparisons alone would not establish transitivity.
+  for (std::size_t left = 0; left < curve_types.size(); ++left) {
+    for (std::size_t right = left + 1; right < curve_types.size(); ++right) {
+      if (!charging_curve_no_slower(
+              instance.charging_curves().at(curve_types[left]),
+              instance.charging_curves().at(curve_types[right]))) {
+        throw std::invalid_argument(
+            "exact TRC path dominance requires a consistent charging curve order");
+      }
+    }
+  }
   std::unordered_map<std::string, std::size_t> rank_by_type;
   for (std::size_t rank = 0; rank < curve_types.size(); ++rank) {
     rank_by_type.emplace(curve_types[rank], rank);
@@ -796,6 +840,9 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
     const std::vector<RouteColumn>& columns,
     SetPartitioningSolveOptions options) {
   const auto call_started = ModelClock::now();
+  if (options.rounded_target_objective_h) {
+    detail::validate_rounded_target(*options.rounded_target_objective_h);
+  }
   if (!std::isfinite(options.progress_interval_s) ||
       options.progress_interval_s <= 0.0 ||
       (options.rounded_target_objective_h.has_value() &&
@@ -850,6 +897,45 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
     mip_start_objective_h = objective_h;
   }
 
+  // Preserve every budget/early-stop entry's original solve order. Paper-default
+  // calls may solve the already-required LP first, and feed it back only later.
+  std::optional<LinearRelaxationResult> reused_relaxation;
+  detail::SpDualCertificate certificate;
+  bool lp_prepass_attempted = false;
+  bool lp_prepass_exception = false;
+  double lp_prepass_wall_s = 0.0;
+  if (options.allow_lp_certificate && instance_.customer_ids().size() > 10 &&
+      mip_start_objective_h &&
+      !deadline && !config_.time_limit_s &&
+      !options.rounded_target_objective_h && !options.incumbent_stall_limit_s &&
+      !options.maximum_wall_time_s) {
+    lp_prepass_attempted = true;
+    const auto lp_started = ModelClock::now();
+    try {
+      reused_relaxation = solve_relaxation(columns, std::nullopt, true);
+    } catch (const CoptException&) {
+      // Do not let a speculative LP backend failure prevent the original MIP.
+      // The ordinary LP feedback position retries using the original path.
+      lp_prepass_exception = true;
+    }
+    lp_prepass_wall_s = wall_seconds(lp_started);
+    if (reused_relaxation && reused_relaxation->status == COPT_STATUS_OPTIMAL) {
+      std::vector<double> costs;
+      costs.reserve(columns.size());
+      for (const auto& column : columns) costs.push_back(column.cost_h);
+      std::vector<double> duals;
+      duals.reserve(instance_.customer_ids().size());
+      for (int customer : instance_.customer_ids()) {
+        const auto it = reused_relaxation->duals.find(customer);
+        duals.push_back(it == reused_relaxation->duals.end()
+            ? std::numeric_limits<double>::quiet_NaN() : it->second);
+      }
+      certificate = detail::certify_sp_start(costs, incidence,
+          options.mip_start_indices, duals,
+          reused_relaxation->effective_abs_gap, config_.mip_gap, true);
+    }
+  }
+
   const auto retained_start = [&](int status) {
     SetPartitioningResult result;
     result.status = status;
@@ -857,6 +943,11 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
     result.wall_runtime_s = wall_seconds(call_started);
     result.mip_start_routes = options.mip_start_indices.size();
     result.mip_start_objective_h = mip_start_objective_h;
+    result.lp_prepass_attempted = lp_prepass_attempted;
+    result.lp_prepass_exception = lp_prepass_exception;
+    result.lp_prepass_wall_s = lp_prepass_wall_s;
+    result.lp_certificate = certificate;
+    result.reused_relaxation = reused_relaxation;
     // This is the validated application incumbent, not a backend solution.
     // Keep solution_count=0 when COPT has not supplied a usable solution.
     if (mip_start_objective_h) {
@@ -869,6 +960,19 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
     }
     return result;
   };
+  if (certificate.certified) {
+    SetPartitioningResult result = retained_start(COPT_STATUS_OPTIMAL);
+    result.status_name = "LP_CERTIFIED_START";
+    result.lp_certified_start = true;
+    result.best_bound_h = certificate.lower_h;
+    if (certificate.lower_h >= 0.0 && certificate.upper_h > 0.0)
+      result.relative_gap = certificate.relative_gap_upper;
+    // Match the MIP decoding's column order, not the supplied start's order.
+    result.selected_columns.clear();
+    for (std::size_t j = 0; j < columns.size(); ++j)
+      if (selected_start[j]) result.selected_columns.push_back(columns[j]);
+    return result;
+  }
   if (model_time_budget(config_, deadline).expired) {
     return retained_start(COPT_STATUS_TIMEOUT);
   }
@@ -876,11 +980,15 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
   configure(model, true);
   std::vector<Var> theta;
   theta.reserve(columns.size());
+  std::size_t next_fixed_zero = 0;
   for (std::size_t index = 0; index < columns.size(); ++index) {
     if ((index & 255U) == 0U && deadline_exhausted(deadline)) {
       return retained_start(COPT_STATUS_TIMEOUT);
     }
-    theta.push_back(model.AddVar(0.0, 1.0, columns[index].cost_h, COPT_BINARY, ("theta_" + std::to_string(index)).c_str()));
+    const bool fixed_zero = next_fixed_zero < certificate.fixed_zero_columns.size() &&
+        certificate.fixed_zero_columns[next_fixed_zero] == index;
+    next_fixed_zero += fixed_zero;
+    theta.push_back(model.AddVar(0.0, fixed_zero ? 0.0 : 1.0, columns[index].cost_h, COPT_BINARY, ("theta_" + std::to_string(index)).c_str()));
   }
   if (deadline_exhausted(deadline)) {
     return retained_start(COPT_STATUS_TIMEOUT);
@@ -905,7 +1013,8 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
 
   model.SetObjSense(COPT_MINIMIZE);
   const CoptModelSize size = model_size(model);
-  const double model_build_runtime_s = wall_seconds(call_started);
+  const double model_build_runtime_s =
+      std::max(0.0, wall_seconds(call_started) - lp_prepass_wall_s);
   if (options.progress) {
     options.progress(SetPartitioningProgress{
         .event = SetPartitioningProgressEvent::ModelBuilt,
@@ -1008,11 +1117,17 @@ SetPartitioningResult CoptSetPartitioning::solve_integer(
                                  options.rounded_target_objective_h),
       .incumbent_stall_limit_reached =
           callback.incumbent_stall_limit_reached(),
-      .model_size = size};
+      .model_size = size,
+      .lp_prepass_attempted = lp_prepass_attempted,
+      .lp_prepass_exception = lp_prepass_exception,
+      .lp_prepass_wall_s = lp_prepass_wall_s,
+      .lp_certificate = certificate,
+      .reused_relaxation = std::move(reused_relaxation)};
 }
 
 LinearRelaxationResult CoptSetPartitioning::solve_relaxation(
-    const std::vector<RouteColumn>& columns, CoptDeadline deadline) {
+    const std::vector<RouteColumn>& columns, CoptDeadline deadline,
+    bool read_certificate_abs_gap) {
   const auto call_started = ModelClock::now();
   const std::vector<std::vector<std::size_t>> incidence =
       customer_incidence(columns);
@@ -1084,7 +1199,9 @@ LinearRelaxationResult CoptSetPartitioning::solve_relaxation(
       .runtime_s = model.GetDblAttr(COPT_DBLATTR_SOLVINGTIME),
       .wall_runtime_s = wall_seconds(call_started),
       .applied_time_limit_s = budget.applied_time_limit_s,
-      .model_size = size};
+      .model_size = size,
+      .effective_abs_gap = read_certificate_abs_gap
+          ? model.GetDblParam(COPT_DBLPARAM_ABSGAP) : 0.0};
 }
 
 CoptFrvcp::CoptFrvcp(const Instance& instance, RouteEvaluator& evaluator,
@@ -1138,6 +1255,7 @@ FrvcpResult CoptFrvcp::optimize_impl(
        incumbent_plan->gaps.size() != customer_ids.size() + 1 ||
        incumbent_plan->route !=
            expand_route(customer_ids, incumbent_plan->gaps) ||
+       factory_.has_adjacent_station_visits(incumbent_plan->route.visits) ||
        incumbent_plan->evaluation == nullptr ||
        !incumbent_plan->evaluation->feasible ||
        !finite_copt_value(incumbent_plan->evaluation->raw_cost_h))) {
@@ -1334,8 +1452,65 @@ FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
     return terminal_result(COPT_STATUS_INFEASIBLE);
   }
 
+  // Compress only variables for consecutive occurrences of the same physical
+  // station. Single-valued F(E) and exactly zero self legs make charge times
+  // telescope. No path, cache key, fallback Plan or external visit is removed.
+  std::size_t compressed_runs = 0, merged_occurrences = 0;
+  std::size_t skipped_non_strict_energy = 0, skipped_nonzero_self_leg = 0;
+  catalog.size.active_station_copies = 0;
+  for (auto& gap : catalog.gaps) {
+    for (auto& spec : gap.paths) {
+      for (std::size_t first = 0; first < spec.stations.size();) {
+        std::size_t last = first;
+        while (last + 1 < spec.stations.size() &&
+               spec.stations[last + 1] == spec.stations[first]) ++last;
+        bool merge = last > first;
+        if (merge) {
+          const int id = spec.stations[first];
+          const auto& points = instance_.curve_for_station(id).points();
+          const bool strict_energy = std::adjacent_find(
+              points.begin(), points.end(), [](const ChargingPoint& a,
+                                               const ChargingPoint& b) {
+                return !(a.energy_wh < b.energy_wh);
+              }) == points.end();
+          const bool zero_self_leg = instance_.travel_time_h(id, id) == 0.0 &&
+              std::all_of(spec.leg_energy_wh.begin() + first + 1,
+                          spec.leg_energy_wh.begin() + last + 1,
+                          [](double energy) { return energy == 0.0; });
+          if (!strict_energy) ++skipped_non_strict_energy;
+          if (!zero_self_leg) ++skipped_nonzero_self_leg;
+          merge = strict_energy && zero_self_leg;
+        }
+        if (merge) {
+          spec.model_station_spans.push_back({first, last});
+          ++compressed_runs;
+          saturating_add(merged_occurrences, last - first);
+        } else {
+          for (std::size_t index = first; index <= last; ++index) {
+            spec.model_station_spans.push_back({index, index});
+          }
+        }
+        first = last + 1;
+      }
+      saturating_add(catalog.size.active_station_copies,
+                     spec.model_station_spans.size());
+    }
+  }
+  // Rare model-boundary diagnostics only, never a route-evaluator hot path.
+  if (compressed_runs || skipped_non_strict_energy || skipped_nonzero_self_leg) {
+    std::clog << "frvcp_station_model_runs original_occurrences="
+              << catalog.size.active_station_visits
+              << " model_copies=" << catalog.size.active_station_copies
+              << " compressed_runs=" << compressed_runs
+              << " merged_occurrences=" << merged_occurrences
+              << " skipped_non_strict_energy=" << skipped_non_strict_energy
+              << " skipped_nonzero_self_leg=" << skipped_nonzero_self_leg << '\n';
+  }
+
   struct PathStationVariables {
     int station_id{};
+    std::size_t first_occurrence{};
+    std::size_t last_occurrence{};
     Var arrival;
     Var departure;
     Var curve_arrival;
@@ -1416,10 +1591,10 @@ FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
                               .origin_energy = origin_energy,
                               .target_energy = target_energy,
                               .stations = {}};
-      variables.stations.reserve(spec.stations.size());
+      variables.stations.reserve(spec.model_station_spans.size());
       Expr previous_departure = origin_energy;
-      for (std::size_t station_index = 0;
-           station_index < spec.stations.size(); ++station_index) {
+      for (const FrvcpStationSpan span : spec.model_station_spans) {
+        const std::size_t station_index = span.first;
         const int station_id = spec.stations[station_index];
         const std::string station_suffix =
             suffix + "_" + std::to_string(station_index);
@@ -1450,6 +1625,8 @@ FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
         objective += charge_duration;
         variables.stations.push_back(PathStationVariables{
             .station_id = station_id,
+            .first_occurrence = span.first,
+            .last_occurrence = span.last,
             .arrival = arrival,
             .departure = departure,
             .curve_arrival = curve_arrival,
@@ -1552,10 +1729,12 @@ FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
         for (std::size_t station_index = 0;
              station_index < selected.stations.size(); ++station_index) {
           PathStationVariables& station = selected.stations[station_index];
-          const std::size_t position =
-              station_positions[gap_index][station_index];
-          const double arrival = evaluation.arrival_energy_wh[position];
-          const double departure = evaluation.departure_energy_wh[position];
+          const std::size_t first_position =
+              station_positions[gap_index][station.first_occurrence];
+          const std::size_t last_position =
+              station_positions[gap_index][station.last_occurrence];
+          const double arrival = evaluation.arrival_energy_wh[first_position];
+          const double departure = evaluation.departure_energy_wh[last_position];
           const ChargingCurve& curve =
               instance_.curve_for_station(station.station_id);
           model.SetMipStart(station.arrival, arrival);
@@ -1670,14 +1849,24 @@ FrvcpResult CoptFrvcp::solve(const std::vector<int>& customer_ids,
     }
     station_paths.push_back(selected->spec->stations);
     std::vector<double> departures;
-    departures.reserve(selected->stations.size());
+    departures.reserve(selected->spec->stations.size());
     for (PathStationVariables& station : selected->stations) {
-      departures.push_back(station.departure.Get(COPT_DBLINFO_VALUE));
+      // Canonical lift: charge at the first original occurrence; every later
+      // identical occurrence has zero charge. Preserve all external indices.
+      const double departure = station.departure.Get(COPT_DBLINFO_VALUE);
+      for (std::size_t occurrence = station.first_occurrence;
+           occurrence <= station.last_occurrence; ++occurrence) {
+        departures.push_back(departure);
+      }
     }
     station_departures.push_back(std::move(departures));
   }
 
   Route route = expand_route(customer_ids, station_paths);
+  if(factory_.has_adjacent_station_visits(route.visits)) {
+    std::fprintf(stderr,"frvcp_plan_rejected reason=adjacent_identical_station retain_incumbent=%d\n",incumbent_plan!=nullptr);
+    return unusable_solution(COPT_STATUS_NUMERICAL);
+  }
   std::vector<std::optional<double>> schedule(route.visits.size());
   std::size_t visit_index = 0;
   for (std::size_t gap_index = 0; gap_index < station_paths.size();

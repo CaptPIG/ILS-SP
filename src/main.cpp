@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "ils_sp/solver.hpp"
+#include "ils_sp/detail/input_contract.hpp"
 
 #ifndef ILS_SP_TYPED_DELETE_ENTRY
 #define ILS_SP_TYPED_DELETE_ENTRY 0
@@ -186,6 +187,12 @@ void log_exact_stage(const ils_sp::ExactStageProgress& progress) {
               << (progress.status_name.empty() ? "none"
                                                : progress.status_name);
     log_optional("objective", progress.objective_h);
+    std::cerr << " rc_fixed_columns=" << progress.rc_fixed_columns
+              << " rc_considered_columns=" << progress.rc_considered_columns
+              << " lp_prepass_s=" << progress.lp_prepass_wall_s
+              << " lp_reused_prepass=" << progress.lp_reused_prepass;
+    log_optional("certificate_gap_upper_h", progress.certificate_gap_upper_h);
+    log_optional("certificate_acceptance_gap_h", progress.certificate_acceptance_gap_h);
     if (progress.stage == ils_sp::ExactStage::SetPartitioning) {
       log_optional("bound", progress.best_bound_h);
       log_optional("gap", progress.relative_gap);
@@ -260,7 +267,7 @@ void log_exact_stage(const ils_sp::ExactStageProgress& progress) {
       << "  --search-profile P      paper, linked-winner, "
          "linked-insertion-candidates, or granular-adaptive\n"
       << "  --cache-capacity N      physical route-evaluation LRU capacity\n"
-      << "  --time-limit SEC        hard global engineering deadline\n"
+      << "  --time-limit SEC        cooperative soft deadline (stages may overrun)\n"
       << "  --rounded-target X      stop when objective rounded to 2 decimals <= X\n"
       << "  --sp-stall-limit SEC    engineering SP stall cap (default: 0/off)\n"
       << "  --sp-time-limit SEC     engineering SP wall cap (default: 0/off)\n"
@@ -283,23 +290,19 @@ void log_exact_stage(const ils_sp::ExactStageProgress& progress) {
       << "  --frvcp-wall-budget SEC  optional solve-wide active FRVCP wall budget\n"
       << "  --copt-output         show COPT logs\n"
       << "  --progress N            checkpoint interval in completed iterations\n";
+  ils_sp::detail::checked_flush(output);
   std::exit(status);
 }
 
 template <typename Integer>
 Integer parse_integer(std::string_view value, std::string_view option) {
-  std::size_t consumed = 0;
-  const unsigned long long parsed = std::stoull(std::string(value), &consumed);
-  if (consumed != value.size()) {
-    throw std::invalid_argument("invalid value for " + std::string(option));
-  }
-  return static_cast<Integer>(parsed);
+  return ils_sp::detail::parse_nonnegative_integer<Integer>(value, option);
 }
 
 double parse_double(std::string_view value, std::string_view option) {
   std::size_t consumed = 0;
   const double parsed = std::stod(std::string(value), &consumed);
-  if (consumed != value.size()) {
+  if (consumed != value.size() || !std::isfinite(parsed)) {
     throw std::invalid_argument("invalid value for " + std::string(option));
   }
   return parsed;
@@ -329,10 +332,8 @@ Arguments parse_arguments(int argc, char** argv) {
       result.config.set_partitioning.threads = threads;
       result.config.frvcp.threads = threads;
     } else if (option == "--sp-threads") {
-      const std::string value(value_after(index, option));
-      std::size_t consumed = 0;
-      const long long threads = std::stoll(value, &consumed);
-      if (consumed != value.size() || threads < 1 || threads > 128) {
+      const int threads = parse_integer<int>(value_after(index, option), option);
+      if (threads < 1 || threads > 128) {
         throw std::invalid_argument("--sp-threads must be between 1 and 128");
       }
       result.config.set_partitioning.sp_integer_threads = static_cast<int>(threads);
@@ -486,6 +487,24 @@ Arguments parse_arguments(int argc, char** argv) {
   if (result.instance.empty()) {
     throw std::invalid_argument("--instance is required");
   }
+  if (result.config.global_time_limit_s) {
+    (void)ils_sp::detail::checked_deadline_after<std::chrono::steady_clock>(
+        std::chrono::steady_clock::now(), *result.config.global_time_limit_s);
+  }
+  if (result.config.sp_maximum_time_s) {
+    (void)ils_sp::detail::checked_deadline_after<std::chrono::steady_clock>(
+        std::chrono::steady_clock::now(), *result.config.sp_maximum_time_s);
+  }
+  if (result.config.rounded_target_objective_h) {
+    ils_sp::detail::validate_rounded_target(*result.config.rounded_target_objective_h);
+  }
+  if (result.config.search_profile == ils_sp::SearchProfile::Paper &&
+      result.config.preserve_station_visits &&
+      !result.config.implicit_replace_path &&
+      !result.config.project_opening_station_visits) {
+    throw std::invalid_argument(
+        "cooperative preserve-cs requires --route-opening-paths projected");
+  }
   return result;
 }
 
@@ -559,6 +578,7 @@ int main(int argc, char** argv) {
     }
     std::cerr << '\n';
     ils_sp::IlsSpSolver solver(instance, environment, arguments.config);
+    std::optional<ils_sp::RecordImprovementProgress> last_search_record;
     const ils_sp::SolverResult result = solver.solve(
         [](const ils_sp::SolverProgress& progress) {
           std::cerr << std::fixed << std::setprecision(6)
@@ -828,7 +848,8 @@ int main(int argc, char** argv) {
         [](const ils_sp::ExactStageProgress& progress) {
           log_exact_stage(progress);
         },
-        [](const ils_sp::RecordImprovementProgress& record) {
+        [&last_search_record](const ils_sp::RecordImprovementProgress& record) {
+          last_search_record = record;
           // Round-trip precision retains the actual double objective, not the
           // two-decimal paper display. Do not change subsequent log formatting.
           const auto flags = std::cerr.flags();
@@ -883,6 +904,15 @@ int main(int argc, char** argv) {
               << "sp_calls=" << result.sp_calls << '\n'
               << "adaptive_sp_calls=" << result.adaptive_sp_calls << '\n'
               << "lp_calls=" << result.lp_calls << '\n'
+              << "sp_lp_variant=n40_dual_start_and_rc_ub0_v2" << '\n'
+              << "sp_lp_prepass_calls=" << result.sp_lp_prepass_calls << '\n'
+              << "sp_lp_certified_calls=" << result.sp_lp_certified_calls << '\n'
+              << "sp_lp_fallback_calls=" << result.sp_lp_fallback_calls << '\n'
+              << "sp_lp_exception_calls=" << result.sp_lp_exception_calls << '\n'
+              << "sp_rc_fixing_calls=" << result.sp_rc_fixing_calls << '\n'
+              << "sp_rc_fixed_columns=" << result.sp_rc_fixed_columns << '\n'
+              << "sp_rc_considered_columns=" << result.sp_rc_considered_columns << '\n'
+              << "sp_lp_prepass_wall_s=" << result.sp_lp_prepass_wall_s << '\n'  
               << "frvcp_calls=" << result.frvcp_calls << '\n'
               << "frvcp_solve_calls=" << result.frvcp_solve_calls << '\n'
               << "frvcp_cache_hits=" << result.frvcp_cache_hits << '\n'
@@ -1149,6 +1179,34 @@ int main(int argc, char** argv) {
               << result.repair_insertion_statistics.partial_route_events << '\n'
               << "destroy_randomized_partial_routes="
               << result.repair_insertion_statistics.randomized_partial_routes << '\n'
+              << "repair_station_shells_retained=" << result.repair_insertion_statistics.station_shells_retained << '\n'
+              << "repair_station_shells_activated=" << result.repair_insertion_statistics.station_shells_activated << '\n'
+              << "repair_station_shells_discarded=" << result.repair_insertion_statistics.station_shells_discarded << '\n'
+              << "repair_station_conservation_checks=" << result.repair_insertion_statistics.station_conservation_checks << '\n'
+              << "repair_station_conservation_rollbacks=" << result.repair_insertion_statistics.station_conservation_rollbacks << '\n'
+              << "repair_station_conservation_noops=" << result.repair_insertion_statistics.station_conservation_noops << '\n'
+              << "repair_station_conservation_effective=" << result.repair_insertion_statistics.station_conservation_effective << '\n'
+              << "repair_variant=" << (arguments.config.preserve_station_visits
+                    ? "joint_affected_station_occurrences_v1" : "legacy") << '\n'
+              << "repair_decision_replay_variant=" << (arguments.config.preserve_station_visits
+                    ? "disabled_joint_station_tokens" : "epoch16_weak_identity_tape_128k") << '\n'
+              << "repair_joint_repair_calls=" << result.repair_insertion_statistics.joint_repair_calls << '\n'
+              << "repair_joint_removed_station_tokens=" << result.repair_insertion_statistics.joint_removed_station_tokens << '\n'
+              << "repair_joint_customer_insertion_attempts=" << result.repair_insertion_statistics.joint_customer_insertion_attempts << '\n'
+              << "repair_joint_station_insertion_attempts=" << result.repair_insertion_statistics.joint_station_insertion_attempts << '\n'
+              << "repair_joint_blocked_token_scans=" << result.repair_insertion_statistics.joint_blocked_token_scans << '\n'
+              << "repair_joint_deadlock_rollbacks=" << result.repair_insertion_statistics.joint_deadlock_rollbacks << '\n'
+              << "repair_joint_invariant_rollbacks=" << result.repair_insertion_statistics.joint_invariant_rollbacks << '\n'
+              << "repair_joint_max_pending_tokens=" << result.repair_insertion_statistics.joint_max_pending_tokens << '\n'
+              << "repair_joint_max_removed_station_tokens=" << result.repair_insertion_statistics.joint_max_removed_station_tokens << '\n'
+              << "repair_memo_hits=" << result.repair_insertion_statistics.repair_memo_hits << '\n'
+              << "repair_memo_misses=" << result.repair_insertion_statistics.repair_memo_misses << '\n'
+              << "repair_memo_epoch_changes=" << result.repair_insertion_statistics.repair_memo_epoch_changes << '\n'
+              << "repair_memo_invalid_entries=" << result.repair_insertion_statistics.repair_memo_invalid_entries << '\n'
+              << "repair_memo_evictions=" << result.repair_insertion_statistics.repair_memo_evictions << '\n'
+              << "repair_memo_byte_bypasses=" << result.repair_insertion_statistics.repair_memo_byte_bypasses << '\n'
+              << "repair_memo_candidates_saved=" << result.repair_insertion_statistics.repair_memo_candidates_saved << '\n'
+              << "repair_memo_profiles_saved=" << result.repair_insertion_statistics.repair_memo_profiles_saved << '\n'
               << "repair_physical_insertion_decisions="
               << result.repair_insertion_statistics.physical_insertion_decisions << '\n'
               << "repair_physical_insertion_candidates="
@@ -1392,6 +1450,15 @@ int main(int argc, char** argv) {
               << result.repair_insertion_statistics
                      .affected_path_completion.acceptance_s
               << '\n';
+    std::cout << "equivalent_scoring_variant=joint_best2_forward_profile_pass_ready_v1\n"
+              << "vnd_two_opt_reverse_label_slots_saved=" << result.vnd_statistics.two_opt_reverse_label_slots_saved << '\n'
+              << "vnd_physical_profile_repeat_checks_saved=" << result.vnd_statistics.physical_profile_repeat_checks_saved << '\n';
+    std::cout << "joint_repair_evaluation_variant=local_route_best2_v1\n"
+              << "repair_joint_rank_cache_hits=" << result.repair_insertion_statistics.joint_rank_cache_hits << '\n'
+              << "repair_joint_rank_cache_misses=" << result.repair_insertion_statistics.joint_rank_cache_misses << '\n'
+              << "repair_joint_rank_fresh_descriptors=" << result.repair_insertion_statistics.joint_rank_fresh_descriptors << '\n'
+              << "repair_joint_rank_reused_descriptors=" << result.repair_insertion_statistics.joint_rank_reused_descriptors << '\n'
+              << "repair_joint_rank_score_calls=" << result.repair_insertion_statistics.joint_rank_score_calls << '\n';
     std::cout << "frvcp_active_wall_spent_s=" << result.frvcp_active_wall_spent_s << '\n'
               << "frvcp_budget_skipped_routes=" << result.frvcp_budget_skipped_routes << '\n'
               << "frvcp_budget_exhausted=" << result.frvcp_budget_exhausted << '\n';
@@ -1400,7 +1467,7 @@ int main(int argc, char** argv) {
                   arguments.config.preserve_station_visits &&
                   !arguments.config.implicit_replace_path &&
                   arguments.config.continuation_policy == ils_sp::ContinuationPolicy::Record
-                      ? "trc_record_generator_procedure_local_no_epoch" : "legacy") << '\n'
+                      ? "trc_record_generator_fixed_vnd_anchor_no_adjacent_station_runs_no_epoch" : "legacy") << '\n'
               << "continuation_exploration_entries=" << result.continuation_exploration_entries << '\n'
               << "continuation_exploration_iterations=" << result.continuation_exploration_iterations << '\n'
               << "continuation_record_exits=" << result.continuation_record_exits << '\n'
@@ -1412,27 +1479,37 @@ int main(int argc, char** argv) {
 #if ILS_SP_TYPED_DELETE_ENTRY
                       ? "remaining_mask_rvnd_forward_only_typed_delete_entry" : "fixed_forward_only_two_opt") << '\n'
 #elif ILS_SP_FORWARD_ONLY_TWO_OPT
-                      ? "remaining_mask_rvnd_forward_only_two_opt" : "fixed_forward_only_two_opt") << '\n'
+                      ? "remaining_mask_rvnd_entry_opening_energy_proxy_uniform_ties" : "fixed_forward_only_two_opt") << '\n'
 #elif ILS_SP_PHYSICAL_REVERSE_EMPTY_CHILD
                       ? "remaining_mask_rvnd_physical_reverse_empty_child" : "fixed") << '\n'
 #else
                       ? "remaining_mask_rvnd" : "fixed") << '\n'
 #endif
-              << "search_feasible_record=" << result.best_solution.has_value() << '\n'
-              << "solution_origin=" << (result.best_solution.has_value() ? "search_record"
-                  : result.initialization_fallback.has_value() ? "initialization_fallback"
-                                                            : "none") << '\n';
-    if (!result.best_solution.has_value()) {
-      if (result.initialization_fallback.has_value()) {
-        const auto& fallback = *result.initialization_fallback;
-        std::cout << "fallback_objective_h=" << fallback.raw_cost_h() << '\n';
-        for (std::size_t index = 0; index < fallback.plans.size(); ++index) {
-          std::cout << "fallback_route_" << index << '=' << instance.depot().id;
-          for (int node : fallback.plans[index].route.visits) std::cout << "->" << node;
-          std::cout << "->" << instance.depot().id << '\n';
-        }
-      }
-
+              << "search_feasible_record=" << result.best_solution.has_value() << '\n';
+    // The retained feasible initialization is output-only. It cannot affect
+    // search record acceptance, pool admission, warm starts or termination.
+    const bool returned_initialization = result.initialization_fallback.has_value();
+    const ils_sp::Solution* returned_solution = returned_initialization
+        ? &*result.initialization_fallback
+        : result.best_solution.has_value() ? &*result.best_solution : nullptr;
+    const char* returned_origin = returned_initialization ? "initialization"
+        : returned_solution ? "search_record" : "none";
+    std::cout << "return_selection_variant=feasible_initialization_or_search_best_v1\n"
+              << "solution_origin=" << returned_origin << '\n';
+    if (returned_solution) {
+      const auto flags = std::cout.flags();
+      const auto precision = std::cout.precision();
+      std::cout << std::defaultfloat
+                << std::setprecision(std::numeric_limits<double>::max_digits10)
+                << "returned_best_iteration="
+                << (returned_initialization ? 0 : last_search_record->iteration) << '\n'
+                << "returned_best_elapsed_s="
+                << (returned_initialization ? result.initialization_runtime_s
+                                            : last_search_record->elapsed_s) << '\n';
+      std::cout.flags(flags);
+      std::cout.precision(precision);
+    } else {
+      std::cout << "returned_best_iteration=none\nreturned_best_elapsed_s=none\n";
       std::cout << "objective_h=none\n"
                 << "sp_skipped_incomplete_pool="
                 << result.sp_skipped_incomplete_pool << '\n'
@@ -1467,16 +1544,17 @@ int main(int argc, char** argv) {
       }
       return 2;
     }
-    std::cout << "objective_h=" << result.best_solution->raw_cost_h() << '\n';
+    std::cout << "objective_h=" << returned_solution->raw_cost_h() << '\n';
     for (std::size_t route_index = 0;
-         route_index < result.best_solution->plans.size(); ++route_index) {
+         route_index < returned_solution->plans.size(); ++route_index) {
       std::cout << "route_" << route_index << '=' << instance.depot().id;
       for (const int node_id :
-           result.best_solution->plans[route_index].route.visits) {
+           returned_solution->plans[route_index].route.visits) {
         std::cout << "->" << node_id;
       }
       std::cout << "->" << instance.depot().id << '\n';
     }
+    ils_sp::detail::checked_flush(std::cout);
     return 0;
   } catch (const CoptException& error) {
     std::cerr << "COPT error " << error.GetCode() << ": "
